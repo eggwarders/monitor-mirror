@@ -317,6 +317,7 @@ struct Shared {
     cushion_ms: AtomicU32,
     restart: AtomicBool,
     quit: AtomicBool,
+    paused: AtomicBool,
     vol_sync: AtomicBool,
     wake_event: AtomicUsize,
     status: AtomicU8,
@@ -339,6 +340,7 @@ impl Shared {
         favorites: HashSet<String>,
         hotkey_mod: u32,
         hotkey_vk: u32,
+        paused: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             src: Mutex::new(src),
@@ -348,6 +350,7 @@ impl Shared {
             cushion_ms: AtomicU32::new(cushion_ms),
             restart: AtomicBool::new(false),
             quit: AtomicBool::new(false),
+            paused: AtomicBool::new(paused),
             vol_sync: AtomicBool::new(vol_sync),
             wake_event: AtomicUsize::new(wake_event),
             status: AtomicU8::new(STATUS_IDLE),
@@ -638,6 +641,18 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
 // ─── WASAPI mirror session (Ultra-Low Latency Pipeline) ───────────────────────
 
 unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> {
+    if shared.paused.load(Ordering::Relaxed) {
+        shared.set_status(STATUS_IDLE);
+        let wake_raw = shared.wake_event.load(Ordering::Relaxed);
+        if wake_raw != 0 {
+            let wake_handle = HANDLE(wake_raw as *mut _);
+            let _ = WaitForSingleObject(wake_handle, 2000);
+        } else {
+            thread::sleep(Duration::from_millis(500));
+        }
+        return Ok(());
+    }
+
     let src_needle = shared.src.lock().unwrap().clone();
     let dst_needle = shared.dst.lock().unwrap().clone();
     let cushion_ms = shared.cushion_ms.load(Ordering::Relaxed);
@@ -849,6 +864,10 @@ fn audio_thread(shared: Arc<Shared>) {
                 continue;
             }
 
+            if shared.paused.load(Ordering::Relaxed) {
+                continue;
+            }
+
             shared.set_status(STATUS_WAITING);
             let wake_raw = shared.wake_event.load(Ordering::Relaxed);
             if wake_raw != 0 {
@@ -918,20 +937,28 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
         let mut dst_guard = shared.dst.lock().unwrap();
         let mut dst_name_guard = shared.dst_name.lock().unwrap();
 
-        let old_src = src_guard.clone();
-        let old_src_name = src_name_guard.clone();
+        let is_dst = next_device.1.id == *dst_guard;
+        let is_src = next_device.1.id == *src_guard;
 
-        *src_guard = next_device.1.id.clone();
-        *src_name_guard = next_device.1.name.clone();
-
-        if *src_guard == *dst_guard {
-            if !old_src.is_empty() && old_src != *src_guard {
-                *dst_guard = old_src;
-                *dst_name_guard = old_src_name;
-            } else if let Some(alt) = devices.iter().find(|d| d.1.id != *src_guard) {
-                *dst_guard = alt.1.id.clone();
-                *dst_name_guard = alt.1.name.clone();
-            }
+        if is_dst {
+            // Switched to destination monitor in the mirror pair; swap them so
+            // the new default captures and mirrors to the other monitor.
+            mem::swap(&mut *src_guard, &mut *dst_guard);
+            mem::swap(&mut *src_name_guard, &mut *dst_name_guard);
+            shared.paused.store(false, Ordering::Relaxed);
+        } else if is_src {
+            // Switched to primary monitor in the mirror pair; unpause mirroring.
+            shared.paused.store(false, Ordering::Relaxed);
+        } else if src_guard.is_empty() {
+            // No mirror pair configured yet; make this the source.
+            *src_guard = next_device.1.id.clone();
+            *src_name_guard = next_device.1.name.clone();
+            shared.paused.store(false, Ordering::Relaxed);
+        } else {
+            // Switched to a standalone device (e.g. Headset) outside the mirror pair.
+            // Keep the monitor pair (src & dst) completely intact for when cycling back!
+            // Pause mirroring so audio plays EXCLUSIVELY through this standalone device.
+            shared.paused.store(true, Ordering::Relaxed);
         }
     }
 
@@ -941,7 +968,21 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
 
     update_tooltip(hwnd, shared);
     if switched {
-        show_balloon(shared, "Audio Output Switched", &format!("Default Output: {}", next_device.1.name));
+        let balloon_msg = if shared.paused.load(Ordering::Relaxed) {
+            format!("Default: {}\n(Mirroring Paused)", next_device.1.name)
+        } else {
+            let other_name = if next_device.1.id == *shared.src.lock().unwrap() {
+                shared.dst_name.lock().unwrap().clone()
+            } else {
+                shared.src_name.lock().unwrap().clone()
+            };
+            if !other_name.is_empty() {
+                format!("Default: {}\n(Mirrored with {})", next_device.1.name, trunc(&other_name, 25))
+            } else {
+                format!("Default: {}", next_device.1.name)
+            }
+        };
+        show_balloon(shared, "Audio Output Switched", &balloon_msg);
     }
 }
 
@@ -1621,7 +1662,13 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let mut items: Vec<Box<CustomMenuItem>> = Vec::new();
 
     // ── 1. SOURCE SECTION (BLUE) ──────────────────────────────────────────
-    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, "SOURCE (Capture Output)", "");
+    let is_paused = shared.paused.load(Ordering::Relaxed);
+    let src_header_text = if is_paused {
+        "SOURCE (Standby - Mirror Paused)"
+    } else {
+        "SOURCE (Capture Output)"
+    };
+    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, src_header_text, "");
     let current_src = shared.src.lock().unwrap().clone();
     for (i, (_dev, info)) in devices.iter().enumerate() {
         let is_chk = is_match(info, &current_src);
@@ -1894,9 +1941,17 @@ unsafe fn select_device(shared: &Shared, is_src: bool, idx: usize) {
                     *shared.src.lock().unwrap() = info.id.clone();
                     *shared.src_name.lock().unwrap() = info.name.clone();
                     set_default_audio_device(&info.id);
+                    shared.paused.store(false, Ordering::Relaxed);
                 } else {
                     *shared.dst.lock().unwrap() = info.id.clone();
                     *shared.dst_name.lock().unwrap() = info.name.clone();
+                    if let Ok(def) = en.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+                        if let Ok(info_def) = describe(&def) {
+                            if info_def.id == *shared.src.lock().unwrap() {
+                                shared.paused.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 shared.restart.store(true, Ordering::Relaxed);
                 shared.signal_wake();
@@ -1935,14 +1990,22 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 unsafe fn update_tooltip(hwnd: HWND, shared: &Shared) {
     let src = shared.src_name.lock().unwrap().clone();
     let dst = shared.dst_name.lock().unwrap().clone();
+    let is_paused = shared.paused.load(Ordering::Relaxed);
 
     let status = match shared.status.load(Ordering::Relaxed) {
         STATUS_ACTIVE => "▶ ",
         STATUS_WAITING => "⏳ ",
+        _ if is_paused => "⏸ ",
         _ => "",
     };
 
-    let tip = if src.is_empty() && dst.is_empty() {
+    let tip = if is_paused {
+        if !src.is_empty() && !dst.is_empty() {
+            format!("⏸ Mirror Paused ({} + {} standby)", trunc(&src, 20), trunc(&dst, 20))
+        } else {
+            "⏸ Mirror Paused".to_string()
+        }
+    } else if src.is_empty() && dst.is_empty() {
         format!("{}Monitor Mirror (no devices selected)", status)
     } else {
         format!(
@@ -2083,6 +2146,40 @@ fn main() {
             }
         }
 
+        // Detect if current Windows default audio device is in the mirror pair
+        let initial_paused = if let Ok(en) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        {
+            let def_id = en
+                .GetDefaultAudioEndpoint(eRender, eMultimedia)
+                .or_else(|_| en.GetDefaultAudioEndpoint(eRender, eConsole))
+                .ok()
+                .and_then(|d| describe(&d).ok())
+                .map(|info| info.id);
+
+            if let Some(ref cur_def) = def_id {
+                if !cfg.src.is_empty() && !cfg.dst.is_empty() {
+                    if cur_def == &cfg.dst {
+                        // Current default is destination monitor; swap so it matches source
+                        mem::swap(&mut cfg.src, &mut cfg.dst);
+                        mem::swap(&mut src_name, &mut dst_name);
+                        false
+                    } else if cur_def == &cfg.src {
+                        false
+                    } else {
+                        // Current default is a different device (e.g. Headset)
+                        true
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let wake_event = CreateEventW(None, false, false, PCWSTR::null()).unwrap_or_default();
         let wake_raw = wake_event.0 as usize;
 
@@ -2097,6 +2194,7 @@ fn main() {
             favorites,
             hotkey_mod,
             hotkey_vk,
+            initial_paused,
         );
 
         let shared_raw: *const Shared = &*shared;

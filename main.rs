@@ -21,7 +21,7 @@ use std::{
 };
 
 use windows::{
-    core::{implement, w, Error, Interface, Result, HSTRING, PCSTR, PCWSTR},
+    core::{implement, w, Error, Result, HSTRING, PCSTR, PCWSTR},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{
@@ -134,8 +134,10 @@ const LOGO_PNG: &[u8] = include_bytes!("media/icon_256.png");
 
 const CLSID_POLICY_CONFIG: windows::core::GUID =
     windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
-const CLSID_POLICY_CONFIG_10: windows::core::GUID =
-    windows::core::GUID::from_u128(0x294fcbf0_e7f1_46dd_92db_d4e05639ff76);
+const IID_POLICY_CONFIG: windows::core::GUID =
+    windows::core::GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);
+const IID_POLICY_CONFIG_VISTA: windows::core::GUID =
+    windows::core::GUID::from_u128(0x568b9108_44bf_40b4_9006_86afe5b5a620);
 
 #[repr(C)]
 struct IPolicyConfigVtbl {
@@ -152,6 +154,18 @@ struct IPolicyConfigVtbl {
     pub SetPropertyValue: unsafe extern "system" fn(*mut c_void, PCWSTR, i32, *mut c_void, *mut c_void) -> windows_core::HRESULT,
     pub SetDefaultEndpoint: unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> windows_core::HRESULT,
     pub SetEndpointVisibility: unsafe extern "system" fn(*mut c_void, PCWSTR, i32) -> windows_core::HRESULT,
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    #[link_name = "CoCreateInstance"]
+    fn CoCreateInstanceRaw(
+        rclsid: *const windows::core::GUID,
+        punkouter: *mut c_void,
+        dwclscontext: u32,
+        riid: *const windows::core::GUID,
+        ppv: *mut *mut c_void,
+    ) -> windows_core::HRESULT;
 }
 
 // ─── Owner-Drawn Menu Structs & Constants ───────────────────────────────────
@@ -480,22 +494,29 @@ unsafe fn set_default_audio_device(endpoint_id: &str) -> bool {
     let wide: Vec<u16> = endpoint_id.encode_utf16().chain(std::iter::once(0)).collect();
     let pcwstr = PCWSTR(wide.as_ptr());
 
-    let mut unk: Option<windows::core::IUnknown> =
-        CoCreateInstance(&CLSID_POLICY_CONFIG_10, None, CLSCTX_ALL).ok();
-    if unk.is_none() {
-        unk = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL).ok();
+    let iids = [IID_POLICY_CONFIG, IID_POLICY_CONFIG_VISTA];
+    for iid in &iids {
+        let mut policy: *mut c_void = ptr::null_mut();
+        let hr = CoCreateInstanceRaw(
+            &CLSID_POLICY_CONFIG,
+            ptr::null_mut(),
+            CLSCTX_ALL.0,
+            iid,
+            &mut policy,
+        );
+        if hr.is_ok() && !policy.is_null() {
+            let vtbl = *(policy as *const *const IPolicyConfigVtbl);
+            let r0 = ((*vtbl).SetDefaultEndpoint)(policy, pcwstr, 0); // eConsole
+            let r1 = ((*vtbl).SetDefaultEndpoint)(policy, pcwstr, 1); // eMultimedia
+            let r2 = ((*vtbl).SetDefaultEndpoint)(policy, pcwstr, 2); // eCommunications
+            let unk_vtbl = *(policy as *const *const windows_core::IUnknown_Vtbl);
+            let _ = ((*unk_vtbl).Release)(policy);
+            if r0.is_ok() || r1.is_ok() || r2.is_ok() {
+                return true;
+            }
+        }
     }
-
-    if let Some(unk) = unk {
-        let this = unk.as_raw();
-        let vtbl = *(this as *const *const IPolicyConfigVtbl);
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 0); // eConsole
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 1); // eMultimedia
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 2); // eCommunications
-        true
-    } else {
-        false
-    }
+    false
 }
 
 // ─── Device helpers ──────────────────────────────────────────────────────────
@@ -862,16 +883,16 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
 
     let favorites = shared.favorites.lock().unwrap().clone();
 
-    // Determine candidate list: if favorites exist, cycle ONLY among favorites; else all devices.
+    // Determine candidate list: if at least 2 favorites exist, cycle ONLY among favorites; else all devices.
     let fav_candidates: Vec<&(IMMDevice, DeviceInfo)> =
         devices.iter().filter(|d| favorites.contains(&d.1.id)).collect();
-    let candidates: Vec<&(IMMDevice, DeviceInfo)> = if !fav_candidates.is_empty() {
+    let candidates: Vec<&(IMMDevice, DeviceInfo)> = if fav_candidates.len() > 1 {
         fav_candidates
     } else {
         devices.iter().collect()
     };
 
-    if candidates.is_empty() {
+    if candidates.len() <= 1 {
         return;
     }
 
@@ -883,14 +904,13 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
         .map(|info| info.id)
         .unwrap_or_else(|| shared.src.lock().unwrap().clone());
 
-    let cur_idx = candidates
-        .iter()
-        .position(|d| d.1.id == current_default_id)
-        .unwrap_or(0);
-    let next_idx = (cur_idx + 1) % candidates.len();
+    let next_idx = match candidates.iter().position(|d| d.1.id == current_default_id) {
+        Some(pos) => (pos + 1) % candidates.len(),
+        None => 0,
+    };
     let next_device = candidates[next_idx];
 
-    set_default_audio_device(&next_device.1.id);
+    let switched = set_default_audio_device(&next_device.1.id);
 
     {
         let mut src_guard = shared.src.lock().unwrap();
@@ -920,7 +940,9 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
     shared.signal_wake();
 
     update_tooltip(hwnd, shared);
-    show_balloon(shared, "Audio Output Switched", &format!("Default Output: {}", next_device.1.name));
+    if switched {
+        show_balloon(shared, "Audio Output Switched", &format!("Default Output: {}", next_device.1.name));
+    }
 }
 
 // ─── Registry: Settings Persistence & Auto-Start ────────────────────────────
@@ -1871,6 +1893,7 @@ unsafe fn select_device(shared: &Shared, is_src: bool, idx: usize) {
                 if is_src {
                     *shared.src.lock().unwrap() = info.id.clone();
                     *shared.src_name.lock().unwrap() = info.name.clone();
+                    set_default_audio_device(&info.id);
                 } else {
                     *shared.dst.lock().unwrap() = info.id.clone();
                     *shared.dst_name.lock().unwrap() = info.name.clone();

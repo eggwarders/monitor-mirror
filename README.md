@@ -21,7 +21,8 @@
   - <span style="color:#EF4444"><b>Red Section</b></span>: Audio Destination (mirror target).
   - <span style="color:#CBD5E1"><b>Silver Accent</b></span>: Real-time Master & Per-Channel Volume Synchronization.
   - <span style="color:#06B6D4"><b>Cyan Accent</b></span>: Instant Sound Switch with hotkey indicator.
-  - <span style="color:#F59E0B"><b>Gold Accent</b></span>: Starred Favorites submenu.
+  - <span style="color:#F59E0B"><b>Gold Accent</b></span>: Starred Favorites submenu (stays open on click for seamless toggling).
+- **🖥️ Per-Monitor V2 High-DPI & Dark Mode**: True native High-DPI font rendering with ClearType for 4K / 1440p displays, complete with dark frame theme integration (no white outlines).
 - **🔊 Volume Synchronization**: Hardware volume keys or taskbar adjustments on the primary device mirror instantly to the secondary output (including left/right channel balance).
 - **🪶 Tiny Footprint**:
   - **Memory**: ~3.5 MB RAM (automatic working set trimming).
@@ -97,3 +98,4 @@ monitor-mirror.exe --src "Speakers" --dst "Monitor" --cushion 3
 ## License
 
 MIT License. Feel free to use, modify, and distribute.
+

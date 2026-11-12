@@ -1,6 +1,6 @@
-// monitor-mirror v0.4.0: Ultra-low latency audio mirroring between WASAPI endpoints,
-// featuring a system-tray UI with color-coded custom menus, embedded logo icon,
-// audio device cycling (SoundSwitch feature) via customizable hotkeys, and favorites.
+// monitor-mirror v0.4.1: Ultra-low latency audio mirroring between WASAPI endpoints,
+// featuring a system-tray UI with color-coded dark menus, embedded high-DPI logo icon,
+// audio device cycling (SoundSwitch feature) via customizable hotkeys, and non-dismissing favorites.
 //
 // Subsystem: Windows (no console window).
 #![windows_subsystem = "windows"]
@@ -21,19 +21,20 @@ use std::{
 };
 
 use windows::{
-    core::{implement, w, Error, Interface, Result, HSTRING, PCWSTR},
+    core::{implement, w, Error, Interface, Result, HSTRING, PCSTR, PCWSTR},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{
             CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HWND,
-            LPARAM, LRESULT, RECT, WAIT_TIMEOUT, WPARAM,
+            LPARAM, LRESULT, POINT, RECT, WAIT_TIMEOUT, WPARAM,
         },
         Graphics::{
             Gdi::{
-                CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject,
-                SetBkMode, SetTextColor, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
-                FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_BOLD,
-                FW_NORMAL, HDC, TRANSPARENT,
+                CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect,
+                SelectObject, SetBkMode, SetTextColor, ScreenToClient, UpdateWindow, DT_LEFT,
+                DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FONT_CHARSET, FONT_CLIP_PRECISION,
+                FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HMONITOR,
+                MONITOR_DEFAULTTONEAREST, MonitorFromPoint, TRANSPARENT,
             },
             GdiPlus::{
                 GdiplusStartup, GdiplusStartupInput, GdipCreateBitmapFromStream,
@@ -59,7 +60,7 @@ use windows::{
                 COINIT_MULTITHREADED, STGM_READ,
             },
             Console::{AttachConsole, ATTACH_PARENT_PROCESS},
-            LibraryLoader::GetModuleHandleW,
+            LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
             Registry::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
                 RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
@@ -80,14 +81,18 @@ use windows::{
                 NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_INFOTIP_FLAGS,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
-                MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-                TrackPopupMenu, TranslateMessage, HICON, IDI_APPLICATION, MENU_ITEM_FLAGS,
-                MF_OWNERDRAW, MF_POPUP, MF_SEPARATOR, MB_ICONERROR, MB_OK, MSG, TPM_BOTTOMALIGN,
-                TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
-                WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONUP, WM_MEASUREITEM, WM_NULL, WM_RBUTTONUP,
-                WNDCLASSW, WS_POPUP,
+                AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+                DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW, GetCursorPos, GetMessageW,
+                GetWindowLongPtrW, LoadIconW, MenuItemFromPoint, MessageBoxW, PostMessageW,
+                PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
+                SetWindowPos, SetWindowsHookExW, TrackPopupMenu, TranslateMessage,
+                UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK, HICON, HMENU, IDI_APPLICATION,
+                MENU_ITEM_FLAGS, MF_OWNERDRAW, MF_POPUP, MF_SEPARATOR, MB_ICONERROR, MB_OK, MSG,
+                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WH_MSGFILTER,
+                WM_APP, WM_COMMAND, WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_INITMENUPOPUP,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+                WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_POPUP,
             },
         },
     },
@@ -95,14 +100,31 @@ use windows::{
 
 // ─── External Windows APIs (Direct linking for minimal overhead) ─────────────
 
+#[link(name = "kernel32")]
 extern "system" {
     fn SetProcessWorkingSetSize(hProcess: *mut c_void, dwMinimumWorkingSetSize: usize, dwMaximumWorkingSetSize: usize) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
     fn GetCurrentThread() -> *mut c_void;
+    fn GetCurrentThreadId() -> u32;
     fn SetThreadPriority(hThread: *mut c_void, nPriority: i32) -> i32;
 }
 
+#[link(name = "user32")]
+extern "system" {
+    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+    fn GetDpiForWindow(hwnd: HWND) -> u32;
+    fn SetMenuInfo(hMenu: HMENU, lpcmi: *const MENUINFO) -> windows::core::BOOL;
+    fn FindWindowW(lpClassName: PCWSTR, lpWindowName: PCWSTR) -> HWND;
+}
+
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(hwnd: HWND, dwAttribute: u32, pvAttribute: *const c_void, cbAttribute: u32) -> windows_core::HRESULT;
+}
+
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 
 // ─── Embedded Logo Asset (High-DPI 256x256 optimized for tray) ───────────────
 
@@ -159,6 +181,20 @@ pub struct DRAWITEMSTRUCT {
     pub itemData: usize,
 }
 
+#[repr(C)]
+pub struct MENUINFO {
+    pub cbSize: u32,
+    pub fMask: u32,
+    pub dwStyle: u32,
+    pub cyMax: u32,
+    pub hbrBack: HBRUSH,
+    pub dwContextHelpID: u32,
+    pub dwMenuData: usize,
+}
+
+pub const MIM_BACKGROUND: u32 = 0x00000002;
+pub const MIM_APPLYTOSUBMENUS: u32 = 0x80000000;
+
 pub const ODT_MENU: u32 = 1;
 pub const ODS_SELECTED: u32 = 0x0001;
 pub const ODS_GRAYED: u32 = 0x0002;
@@ -214,7 +250,7 @@ const CLR_BG_DST_HOVER: COLORREF = COLORREF(0x0018183B); // #3B1818 subtle red g
 
 const CLR_TEXT: COLORREF = COLORREF(0x00F0E8E2);      // #E2E8F0 clean crisp text
 const CLR_TEXT_MUTED: COLORREF = COLORREF(0x00A0948C);// #8C94A0 muted grey
-const CLR_SEPARATOR: COLORREF = COLORREF(0x00403838); // #383840 divider
+const CLR_SEPARATOR: COLORREF = COLORREF(0x003D3535); // #35353D divider
 
 // Section accents:
 const CLR_BLUE_ACCENT: COLORREF = COLORREF(0x00F6823B); // #3B82F6 vibrant blue
@@ -272,9 +308,7 @@ struct Shared {
     status: AtomicU8,
     hwnd: AtomicIsize,
     notified: AtomicBool,
-    // Favorites set of endpoint IDs
     favorites: Mutex<HashSet<String>>,
-    // Hotkey modifiers and key
     hotkey_mod: AtomicU32,
     hotkey_vk: AtomicU32,
 }
@@ -336,6 +370,86 @@ impl Shared {
     }
 }
 
+// ─── Windows Dark Mode & High-DPI Helpers ────────────────────────────────────
+
+static ALLOW_DARK_MODE_PROC: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_MENU_DPI: AtomicU32 = AtomicU32::new(96);
+
+unsafe fn enable_dark_mode() {
+    type FnSetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+    if let Ok(uxtheme) = LoadLibraryW(w!("uxtheme.dll")) {
+        // Ordinal 135 is SetPreferredAppMode (Windows 10 1903+)
+        if let Some(proc) = GetProcAddress(uxtheme, PCSTR(135 as usize as *const u8)) {
+            let func: FnSetPreferredAppMode = mem::transmute(proc);
+            func(2); // 2 = ForceDark
+        } else if let Some(proc) = GetProcAddress(uxtheme, PCSTR(132 as usize as *const u8)) {
+            let func: FnSetPreferredAppMode = mem::transmute(proc);
+            func(1); // 1 = AllowDark
+        }
+
+        // Ordinal 133 is AllowDarkModeForWindow (Windows 10 1809+)
+        if let Some(proc) = GetProcAddress(uxtheme, PCSTR(133 as usize as *const u8)) {
+            ALLOW_DARK_MODE_PROC.store(proc as *mut c_void, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Applies immersive dark mode, dark borders, and strips white non-client frames from Win32 menus
+unsafe fn apply_menu_dark_mode(hwnd: HWND) {
+    if hwnd.is_invalid() || hwnd.0.is_null() {
+        return;
+    }
+
+    // 1. Opt-in menu window to Dark Mode via uxtheme
+    let proc = ALLOW_DARK_MODE_PROC.load(Ordering::Relaxed);
+    if !proc.is_null() {
+        type FnAllow = unsafe extern "system" fn(HWND, windows::core::BOOL) -> windows::core::BOOL;
+        let func: FnAllow = mem::transmute(proc);
+        let _ = func(hwnd, windows::core::BOOL(1));
+    }
+
+    // 2. DWM Immersive Dark Mode attribute (20 for Win 11 / modern Win 10, 19 for older builds)
+    let dark: i32 = 1;
+    let _ = DwmSetWindowAttribute(hwnd, 20, &dark as *const _ as *const c_void, 4);
+    let _ = DwmSetWindowAttribute(hwnd, 19, &dark as *const _ as *const c_void, 4);
+
+    // 3. DWM Border Color (attribute 34): match menu background #1F1F23 to eliminate white outline!
+    let border: u32 = 0x00231F1F;
+    let _ = DwmSetWindowAttribute(hwnd, 34, &border as *const _ as *const c_void, 4);
+
+    // 4. Strip bright non-client frames (WS_EX_DLGMODALFRAME / WS_EX_WINDOWEDGE)
+    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let mask = (WS_EX_DLGMODALFRAME.0 | WS_EX_WINDOWEDGE.0) as isize;
+    if (ex & mask) != 0 {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !mask);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Retrieves the exact physical DPI of the monitor containing the given screen point
+unsafe fn get_dpi_for_screen_point(pt: POINT) -> u32 {
+    let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if !mon.0.is_null() {
+        type FnGetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> windows_core::HRESULT;
+        if let Ok(shcore) = LoadLibraryW(w!("shcore.dll")) {
+            if let Some(proc) = GetProcAddress(shcore, PCSTR(b"GetDpiForMonitor\0".as_ptr())) {
+                let func: FnGetDpiForMonitor = mem::transmute(proc);
+                let mut dx = 0u32;
+                let mut dy = 0u32;
+                if func(mon, 0 /* MDT_EFFECTIVE_DPI */, &mut dx, &mut dy).is_ok() && dx > 0 {
+                    return dx;
+                }
+            }
+        }
+    }
+    96
+}
+
 // ─── Image & Icon Loader (GDI+ embedded PNG decoder) ─────────────────────────
 
 unsafe fn create_app_icon() -> HICON {
@@ -366,7 +480,6 @@ unsafe fn set_default_audio_device(endpoint_id: &str) -> bool {
     let wide: Vec<u16> = endpoint_id.encode_utf16().chain(std::iter::once(0)).collect();
     let pcwstr = PCWSTR(wide.as_ptr());
 
-    // Try Windows 10/11 GUID first, fallback to Vista/7/8 GUID
     let mut unk: Option<windows::core::IUnknown> =
         CoCreateInstance(&CLSID_POLICY_CONFIG_10, None, CLSCTX_ALL).ok();
     if unk.is_none() {
@@ -376,10 +489,9 @@ unsafe fn set_default_audio_device(endpoint_id: &str) -> bool {
     if let Some(unk) = unk {
         let this = unk.as_raw();
         let vtbl = *(this as *const *const IPolicyConfigVtbl);
-        // Roles: 0 = eConsole (games/apps), 1 = eMultimedia (music/browser), 2 = eCommunications (discord/calls)
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 0);
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 1);
-        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 2);
+        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 0); // eConsole
+        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 1); // eMultimedia
+        let _ = ((*vtbl).SetDefaultEndpoint)(this, pcwstr, 2); // eCommunications
         true
     } else {
         false
@@ -481,7 +593,6 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
                 .SetMasterVolumeLevelScalar(d.fMasterVolume, ptr::null());
             let _ = self.dst_vol.SetMute(d.bMuted.into(), ptr::null());
 
-            // Mirror per-channel balance
             let src_channels = d.nChannels as usize;
             if src_channels > 0 {
                 if let Ok(dst_channels) = self.dst_vol.GetChannelCount() {
@@ -625,7 +736,6 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
         loop {
             let w = WaitForMultipleObjects(&wait_handles, false, 250);
 
-            // Instant wake-up check
             if shared.restart.load(Ordering::Relaxed) || shared.quit.load(Ordering::Relaxed) {
                 break;
             }
@@ -765,7 +875,6 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
         return;
     }
 
-    // Determine current default endpoint ID
     let current_default_id = en
         .GetDefaultAudioEndpoint(eRender, eMultimedia)
         .or_else(|_| en.GetDefaultAudioEndpoint(eRender, eConsole))
@@ -781,10 +890,8 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
     let next_idx = (cur_idx + 1) % candidates.len();
     let next_device = candidates[next_idx];
 
-    // Set Windows default audio endpoint
     set_default_audio_device(&next_device.1.id);
 
-    // Update Monitor Mirror source to the new primary audio device
     {
         let mut src_guard = shared.src.lock().unwrap();
         let mut src_name_guard = shared.src_name.lock().unwrap();
@@ -797,7 +904,6 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
         *src_guard = next_device.1.id.clone();
         *src_name_guard = next_device.1.name.clone();
 
-        // Avoid self-mirror loop: if new src matches dst, switch dst to the old src or another device!
         if *src_guard == *dst_guard {
             if !old_src.is_empty() && old_src != *src_guard {
                 *dst_guard = old_src;
@@ -1017,6 +1123,115 @@ fn set_autostart(enable: bool) {
     }
 }
 
+// ─── Modal Menu Active Context for Non-Dismissing Favorites ──────────────────
+
+struct ActiveMenuContext {
+    fav_menu: HMENU,
+    devices: Vec<DeviceInfo>,
+    items_ptr: *mut Vec<Box<CustomMenuItem>>,
+    menu_brush: HBRUSH,
+}
+
+unsafe impl Send for ActiveMenuContext {}
+unsafe impl Sync for ActiveMenuContext {}
+
+static ACTIVE_MENU_CTX: Mutex<Option<ActiveMenuContext>> = Mutex::new(None);
+
+/// Global Windows message hook that intercepts clicks inside the Favorites submenu
+/// and toggles favorites in place without closing the right-click menu!
+unsafe extern "system" fn menu_msg_filter_hook(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode == 2 /* MSGF_MENU */ {
+        let msg = &mut *(lparam.0 as *mut MSG);
+        if !msg.hwnd.is_invalid() && !msg.hwnd.0.is_null() {
+            apply_menu_dark_mode(msg.hwnd);
+        }
+
+        if msg.message == WM_LBUTTONDOWN || msg.message == WM_LBUTTONUP {
+            if let Ok(guard) = ACTIVE_MENU_CTX.lock() {
+                if let Some(ctx) = guard.as_ref() {
+                    let mut idx = MenuItemFromPoint(None, ctx.fav_menu, msg.pt);
+                    if idx < 0 && !msg.hwnd.is_invalid() && !msg.hwnd.0.is_null() {
+                        let mut client_pt = msg.pt;
+                        let _ = ScreenToClient(msg.hwnd, &mut client_pt);
+                        idx = MenuItemFromPoint(Some(msg.hwnd), ctx.fav_menu, client_pt);
+                    }
+
+                    if idx >= 0 {
+                        if msg.message == WM_LBUTTONUP {
+                            let uidx = idx as usize;
+                            if uidx < ctx.devices.len() {
+                                let dev_id = &ctx.devices[uidx].id;
+                                let p = GLOBAL_SHARED.load(Ordering::Relaxed);
+                                if !p.is_null() {
+                                    let shared = &*p;
+                                    let mut favs = shared.favorites.lock().unwrap();
+                                    let was_fav = favs.contains(dev_id);
+                                    if was_fav {
+                                        favs.remove(dev_id);
+                                    } else {
+                                        favs.insert(dev_id.clone());
+                                    }
+                                    let has_favs = !favs.is_empty();
+                                    drop(favs);
+                                    save_current_settings(shared);
+
+                                    let items = &mut *ctx.items_ptr;
+                                    for it in items.iter_mut() {
+                                        if it.id == IDM_FAV_BASE + uidx as u16 {
+                                            it.checked = !was_fav;
+                                            it.shortcut = if !was_fav { "★" } else { "" }.to_string();
+                                        } else if it.kind == MenuItemKind::FavoritesHeader {
+                                            it.checked = has_favs;
+                                            it.text = if !has_favs {
+                                                "★ Favorites (None set)"
+                                            } else {
+                                                "★ Favorites"
+                                            }.to_string();
+                                        }
+                                    }
+                                }
+                            } else if uidx == ctx.devices.len() + 1 /* Clear All Favorites */ {
+                                let p = GLOBAL_SHARED.load(Ordering::Relaxed);
+                                if !p.is_null() {
+                                    let shared = &*p;
+                                    shared.favorites.lock().unwrap().clear();
+                                    save_current_settings(shared);
+
+                                    let items = &mut *ctx.items_ptr;
+                                    for it in items.iter_mut() {
+                                        if it.kind == MenuItemKind::ItemFavorite {
+                                            it.checked = false;
+                                            it.shortcut = String::new();
+                                        } else if it.kind == MenuItemKind::FavoritesHeader {
+                                            it.checked = false;
+                                            it.text = "★ Favorites (None set)".to_string();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Instantly repaint all active popup menus (both submenu and root)
+                            let mut cur = FindWindowExW(None, None, w!("#32768"), PCWSTR::null()).ok();
+                            while let Some(w) = cur {
+                                if !w.is_invalid() && !w.0.is_null() {
+                                    let _ = InvalidateRect(Some(w), None, true);
+                                    let _ = UpdateWindow(w);
+                                }
+                                cur = FindWindowExW(None, Some(w), w!("#32768"), PCWSTR::null()).ok();
+                            }
+                        }
+
+                        // Neutralize message so Windows menu loop NEVER terminates on favorites clicks!
+                        msg.message = WM_NULL;
+                        return LRESULT(1);
+                    }
+                }
+            }
+        }
+    }
+    CallNextHookEx(None, ncode, wparam, lparam)
+}
+
 // ─── Tray Icon & Color-Coded Right-Click Menu ────────────────────────────────
 
 static GLOBAL_SHARED: AtomicPtr<Shared> = AtomicPtr::new(ptr::null_mut());
@@ -1040,23 +1255,49 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             handle_menu_command(hwnd, (wp.0 & 0xFFFF) as u16);
             LRESULT(0)
         }
+        WM_INITMENUPOPUP => {
+            // Apply native dark mode and background brush to the menu and its window
+            let hmenu = HMENU(wp.0 as _);
+            if let Ok(guard) = ACTIVE_MENU_CTX.lock() {
+                if let Some(ctx) = guard.as_ref() {
+                    let mi = MENUINFO {
+                        cbSize: mem::size_of::<MENUINFO>() as u32,
+                        fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+                        dwStyle: 0,
+                        cyMax: 0,
+                        hbrBack: ctx.menu_brush,
+                        dwContextHelpID: 0,
+                        dwMenuData: 0,
+                    };
+                    let _ = SetMenuInfo(hmenu, &mi);
+                }
+            }
+            // Remove white outline: set dark mode attribute on the popup menu window (#32768)
+            let menu_hwnd = FindWindowW(w!("#32768"), PCWSTR::null());
+            apply_menu_dark_mode(menu_hwnd);
+            LRESULT(0)
+        }
         WM_MEASUREITEM => {
             let mis = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
             if mis.CtlType == ODT_MENU && mis.itemData != 0 {
                 let item = &*(mis.itemData as *const CustomMenuItem);
+                let dpi = ACTIVE_MENU_DPI.load(Ordering::Relaxed);
+                let dpi = if dpi == 0 { 96 } else { dpi };
+                let scale = dpi as f32 / 96.0;
+
                 match item.kind {
                     MenuItemKind::Separator => {
-                        mis.itemHeight = 9;
-                        mis.itemWidth = 100;
+                        mis.itemHeight = (9.0 * scale).round() as u32;
+                        mis.itemWidth = (140.0 * scale).round() as u32;
                     }
                     MenuItemKind::HeaderSource | MenuItemKind::HeaderDest | MenuItemKind::FavoritesHeader => {
-                        mis.itemHeight = 24;
-                        mis.itemWidth = 240;
+                        mis.itemHeight = (26.0 * scale).round() as u32;
+                        mis.itemWidth = (300.0 * scale).round() as u32;
                     }
                     _ => {
-                        mis.itemHeight = 26;
-                        let text_len = (item.text.chars().count() * 7 + item.shortcut.chars().count() * 7 + 70) as u32;
-                        mis.itemWidth = text_len.max(260);
+                        mis.itemHeight = (28.0 * scale).round() as u32;
+                        let text_w = (item.text.chars().count() * 8 + item.shortcut.chars().count() * 8 + 80) as f32 * scale;
+                        mis.itemWidth = text_w.max(320.0 * scale).round() as u32;
                     }
                 }
             }
@@ -1066,7 +1307,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
             if dis.CtlType == ODT_MENU && dis.itemData != 0 {
                 let item = &*(dis.itemData as *const CustomMenuItem);
-                draw_menu_item(dis, item);
+                draw_menu_item(dis, item, hwnd);
             }
             LRESULT(1)
         }
@@ -1085,13 +1326,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
+unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWND) {
     let hdc = dis.hDC;
     let rc = dis.rcItem;
     let selected = (dis.itemState & ODS_SELECTED) != 0;
     let disabled = (dis.itemState & ODS_GRAYED) != 0 || (dis.itemState & ODS_DISABLED) != 0;
 
-    // Background color selection
+    let dpi = ACTIVE_MENU_DPI.load(Ordering::Relaxed);
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let scale = dpi as f32 / 96.0;
+
     let bg_color = match item.kind {
         MenuItemKind::ItemSource if selected => CLR_BG_SRC_HOVER,
         MenuItemKind::ItemDest if selected => CLR_BG_DST_HOVER,
@@ -1105,11 +1349,12 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
 
     if item.kind == MenuItemKind::Separator {
         let sep_brush = CreateSolidBrush(CLR_SEPARATOR);
+        let pad_h = (12.0 * scale) as i32;
         let sep_rect = RECT {
-            left: rc.left + 12,
-            top: rc.top + 4,
-            right: rc.right - 12,
-            bottom: rc.top + 5,
+            left: rc.left + pad_h,
+            top: rc.top + (4.0 * scale) as i32,
+            right: rc.right - pad_h,
+            bottom: rc.top + (5.0 * scale).max(rc.top as f32 + 1.0) as i32,
         };
         FillRect(hdc, &sep_rect, sep_brush);
         let _ = DeleteObject(sep_brush.into());
@@ -1118,29 +1363,40 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Font selection: bold for headers and active device
+    // Font selection: crisp native point size proportional to physical monitor DPI
     let font_weight = match item.kind {
         MenuItemKind::HeaderSource | MenuItemKind::HeaderDest | MenuItemKind::FavoritesHeader => FW_BOLD,
         MenuItemKind::ItemSource | MenuItemKind::ItemDest if item.checked => FW_BOLD,
         MenuItemKind::SoundSwitch => FW_BOLD,
         _ => FW_NORMAL,
     };
+
+    // 10pt Segoe UI scaled to exact monitor DPI for pin-sharp ClearType anti-aliasing
+    let font_height = -((10 * dpi as i32 + 36) / 72);
     let font = CreateFontW(
-        15, 0, 0, 0, font_weight.0 as i32, 0, 0, 0,
-        FONT_CHARSET(0), FONT_OUTPUT_PRECISION(0), FONT_CLIP_PRECISION(0), FONT_QUALITY(5), 0,
+        font_height,
+        0, 0, 0,
+        font_weight.0 as i32,
+        0, 0, 0,
+        FONT_CHARSET(1), // DEFAULT_CHARSET for full Unicode and symbol support
+        FONT_OUTPUT_PRECISION(0),
+        FONT_CLIP_PRECISION(0),
+        FONT_QUALITY(5), // CLEARTYPE_QUALITY
+        0,
         w!("Segoe UI"),
     );
     let old_font = SelectObject(hdc, font.into());
 
     // Left accent pill or indicator
+    let pill_w = (4.0 * scale).max(3.0) as i32;
     match item.kind {
         MenuItemKind::HeaderSource => {
             let pill_brush = CreateSolidBrush(CLR_BLUE_ACCENT);
             let pill_rect = RECT {
-                left: rc.left + 4,
-                top: rc.top + 5,
-                right: rc.left + 7,
-                bottom: rc.bottom - 5,
+                left: rc.left + (5.0 * scale) as i32,
+                top: rc.top + (5.0 * scale) as i32,
+                right: rc.left + (5.0 * scale) as i32 + pill_w,
+                bottom: rc.bottom - (5.0 * scale) as i32,
             };
             FillRect(hdc, &pill_rect, pill_brush);
             let _ = DeleteObject(pill_brush.into());
@@ -1148,10 +1404,10 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
         MenuItemKind::HeaderDest => {
             let pill_brush = CreateSolidBrush(CLR_RED_ACCENT);
             let pill_rect = RECT {
-                left: rc.left + 4,
-                top: rc.top + 5,
-                right: rc.left + 7,
-                bottom: rc.bottom - 5,
+                left: rc.left + (5.0 * scale) as i32,
+                top: rc.top + (5.0 * scale) as i32,
+                right: rc.left + (5.0 * scale) as i32 + pill_w,
+                bottom: rc.bottom - (5.0 * scale) as i32,
             };
             FillRect(hdc, &pill_rect, pill_brush);
             let _ = DeleteObject(pill_brush.into());
@@ -1159,10 +1415,10 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
         MenuItemKind::SoundSwitch => {
             let pill_brush = CreateSolidBrush(CLR_CYAN_ACCENT);
             let pill_rect = RECT {
-                left: rc.left + 4,
-                top: rc.top + 5,
-                right: rc.left + 7,
-                bottom: rc.bottom - 5,
+                left: rc.left + (5.0 * scale) as i32,
+                top: rc.top + (5.0 * scale) as i32,
+                right: rc.left + (5.0 * scale) as i32 + pill_w,
+                bottom: rc.bottom - (5.0 * scale) as i32,
             };
             FillRect(hdc, &pill_rect, pill_brush);
             let _ = DeleteObject(pill_brush.into());
@@ -1181,14 +1437,14 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
         };
         SetTextColor(hdc, check_color);
         let mut check_glyph = if item.kind == MenuItemKind::ItemFavorite {
-            [0x2605u16, 0] // ★
+            [0x2605u16] // ★ (Single glyph slice: no trailing null character)
         } else {
-            [0x2713u16, 0] // ✓
+            [0x2713u16] // ✓
         };
         let mut check_rect = RECT {
-            left: rc.left + 8,
+            left: rc.left + (10.0 * scale) as i32,
             top: rc.top,
-            right: rc.left + 24,
+            right: rc.left + (26.0 * scale) as i32,
             bottom: rc.bottom,
         };
         DrawTextW(hdc, &mut check_glyph, &mut check_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1212,26 +1468,26 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem) {
     };
     SetTextColor(hdc, text_color);
 
-    // Main text
+    // Main text (exact length slice: zero blur or trailing null glyph artifact)
     let mut text_rect = RECT {
-        left: rc.left + 28,
+        left: rc.left + (30.0 * scale) as i32,
         top: rc.top,
-        right: rc.right - 60,
+        right: rc.right - (60.0 * scale) as i32,
         bottom: rc.bottom,
     };
-    let mut wide_text: Vec<u16> = item.text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut wide_text: Vec<u16> = item.text.encode_utf16().collect();
     DrawTextW(hdc, &mut wide_text, &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // Shortcut label (right aligned)
     if !item.shortcut.is_empty() {
         SetTextColor(hdc, CLR_TEXT_MUTED);
         let mut sc_rect = RECT {
-            left: rc.right - 90,
+            left: rc.right - (120.0 * scale) as i32,
             top: rc.top,
-            right: rc.right - 14,
+            right: rc.right - (16.0 * scale) as i32,
             bottom: rc.bottom,
         };
-        let mut wide_sc: Vec<u16> = item.shortcut.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut wide_sc: Vec<u16> = item.shortcut.encode_utf16().collect();
         DrawTextW(hdc, &mut wide_sc, &mut sc_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
@@ -1266,7 +1522,7 @@ fn get_hotkey_description(mod_code: u32, vk: u32) -> String {
 
 unsafe fn push_custom_item(
     items: &mut Vec<Box<CustomMenuItem>>,
-    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    menu: HMENU,
     id: u16,
     kind: MenuItemKind,
     checked: bool,
@@ -1293,8 +1549,8 @@ unsafe fn push_custom_item(
 
 unsafe fn push_custom_popup(
     items: &mut Vec<Box<CustomMenuItem>>,
-    parent_menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    sub_menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    parent_menu: HMENU,
+    sub_menu: HMENU,
     kind: MenuItemKind,
     checked: bool,
     text: &str,
@@ -1317,6 +1573,11 @@ unsafe fn push_custom_popup(
 }
 
 unsafe fn show_context_menu(hwnd: HWND) {
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let dpi = get_dpi_for_screen_point(pt);
+    ACTIVE_MENU_DPI.store(dpi, Ordering::Relaxed);
+
     let p = GLOBAL_SHARED.load(Ordering::Relaxed);
     if p.is_null() {
         return;
@@ -1335,7 +1596,6 @@ unsafe fn show_context_menu(hwnd: HWND) {
         .and_then(|e| enumerate_devices(e).ok())
         .unwrap_or_default();
 
-    // Storage for custom menu item allocations during modal TrackPopupMenu
     let mut items: Vec<Box<CustomMenuItem>> = Vec::new();
 
     // ── 1. SOURCE SECTION (BLUE) ──────────────────────────────────────────
@@ -1376,6 +1636,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 4. FAVORITES SUBMENU (GOLD) ───────────────────────────────────────
     let fav_menu = CreatePopupMenu().unwrap_or_default();
     let favorites = shared.favorites.lock().unwrap().clone();
+    let dev_infos: Vec<DeviceInfo> = devices.iter().map(|d| d.1.clone()).collect();
+
     for (i, (_dev, info)) in devices.iter().enumerate() {
         let is_fav = favorites.contains(&info.id);
         push_custom_item(
@@ -1438,9 +1700,38 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 8. EXIT ───────────────────────────────────────────────────────────
     push_custom_item(&mut items, menu, IDM_EXIT, MenuItemKind::Exit, false, "Exit", "");
 
+    // Set menu background brush to eliminate white gaps
+    let menu_brush = CreateSolidBrush(CLR_BG);
+    let mi = MENUINFO {
+        cbSize: mem::size_of::<MENUINFO>() as u32,
+        fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+        dwStyle: 0,
+        cyMax: 0,
+        hbrBack: menu_brush,
+        dwContextHelpID: 0,
+        dwMenuData: 0,
+    };
+    let _ = SetMenuInfo(menu, &mi);
+    let _ = SetMenuInfo(fav_menu, &mi);
+    let _ = SetMenuInfo(hk_menu, &mi);
+
+    // Set up active menu context and message hook to keep Favorites open on click!
+    let items_ptr: *mut Vec<Box<CustomMenuItem>> = &mut items;
+    *ACTIVE_MENU_CTX.lock().unwrap() = Some(ActiveMenuContext {
+        fav_menu,
+        devices: dev_infos,
+        items_ptr,
+        menu_brush,
+    });
+
+    let hook: HHOOK = SetWindowsHookExW(
+        WH_MSGFILTER,
+        Some(menu_msg_filter_hook),
+        None,
+        GetCurrentThreadId(),
+    ).unwrap_or_default();
+
     // Track popup menu with reliable outside-click dismissal
-    let mut pt = Default::default();
-    let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
     let _ = TrackPopupMenu(
         menu,
@@ -1453,6 +1744,12 @@ unsafe fn show_context_menu(hwnd: HWND) {
     );
     let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
 
+    if !hook.is_invalid() {
+        let _ = UnhookWindowsHookEx(hook);
+    }
+    *ACTIVE_MENU_CTX.lock().unwrap() = None;
+
+    let _ = DeleteObject(menu_brush.into());
     let _ = DestroyMenu(fav_menu);
     let _ = DestroyMenu(hk_menu);
     let _ = DestroyMenu(menu);
@@ -1705,10 +2002,16 @@ fn fatal(msg: &str) -> ! {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
-    let (do_list, mut cfg) = parse();
-
     unsafe {
+        // Enable native Per-Monitor V2 DPI awareness: prevents any blur or bitmap scaling on high-DPI displays!
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        // Enable Windows 10/11 Dark Mode for Win32 menus: eliminates the white border!
+        enable_dark_mode();
+
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let (do_list, mut cfg) = parse();
 
         if do_list {
             let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
@@ -1820,7 +2123,7 @@ fn main() {
         let audio_shared = Arc::clone(&shared);
         let audio_handle = thread::spawn(move || audio_thread(audio_shared));
 
-        // Trim process working set memory: releases cold startup pages, dropping resident RAM to ~1.5 MB!
+        // Trim process working set memory: releases cold startup pages, dropping resident RAM to ~3.5 MB!
         SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
 
         // Win32 message loop (dormant when idle, 0.00% CPU)

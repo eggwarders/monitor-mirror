@@ -26,7 +26,7 @@ use windows::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{
             CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HWND,
-            LPARAM, LRESULT, POINT, RECT, WAIT_TIMEOUT, WPARAM,
+            LPARAM, LRESULT, POINT, PROPERTYKEY, RECT, WAIT_TIMEOUT, WPARAM,
         },
         Graphics::{
             Gdi::{
@@ -42,12 +42,13 @@ use windows::{
             },
         },
         Media::Audio::{
-            eConsole, eMultimedia, eRender,
+            eConsole, eMultimedia, eRender, EDataFlow, ERole, DEVICE_STATE,
             Endpoints::{
                 IAudioEndpointVolume, IAudioEndpointVolumeCallback,
                 IAudioEndpointVolumeCallback_Impl,
             },
             IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+            IMMNotificationClient, IMMNotificationClient_Impl,
             MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIO_VOLUME_NOTIFICATION_DATA,
@@ -98,7 +99,57 @@ use windows::{
     },
 };
 
-// ─── External Windows APIs (Direct linking for minimal overhead) ─────────────
+#[windows_core::implement(IMMNotificationClient)]
+struct DeviceNotifier {
+    shared: Arc<Shared>,
+}
+
+impl IMMNotificationClient_Impl for DeviceNotifier_Impl {
+    fn OnDeviceStateChanged(&self, _device_id: &PCWSTR, _new_state: DEVICE_STATE) -> Result<()> {
+        self.shared.restart.store(true, Ordering::Relaxed);
+        self.shared.signal_wake();
+        Ok(())
+    }
+    fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> Result<()> {
+        self.shared.restart.store(true, Ordering::Relaxed);
+        self.shared.signal_wake();
+        Ok(())
+    }
+    fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> Result<()> {
+        self.shared.restart.store(true, Ordering::Relaxed);
+        self.shared.signal_wake();
+        Ok(())
+    }
+    fn OnDefaultDeviceChanged(&self, flow: EDataFlow, role: ERole, default_device_id: &PCWSTR) -> Result<()> {
+        if flow == eRender && (role == eMultimedia || role == eConsole) {
+            let def_str = if !default_device_id.is_null() {
+                unsafe { default_device_id.to_string().unwrap_or_default() }
+            } else {
+                String::new()
+            };
+            let src_id = self.shared.src.lock().unwrap().clone();
+            if !src_id.is_empty() {
+                let is_src = !def_str.is_empty() && def_str.eq_ignore_ascii_case(&src_id);
+                self.shared.paused.store(!is_src, Ordering::Relaxed);
+                self.shared.restart.store(true, Ordering::Relaxed);
+                self.shared.signal_wake();
+                let hwnd_raw = self.shared.hwnd.load(Ordering::Relaxed);
+                if hwnd_raw != 0 {
+                    unsafe {
+                        update_tooltip(HWND(hwnd_raw as *mut _), &self.shared);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn OnPropertyValueChanged(&self, _device_id: &PCWSTR, _key: &PROPERTYKEY) -> Result<()> {
+        Ok(())
+    }
+}
+
+
+
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -661,6 +712,25 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
         return Err(Error::from(E_FAIL));
     }
 
+    // Verify current Windows default output matches the mirror source.
+    // If not (e.g. headset active), keep monitors silent and pause.
+    if let Ok(def) = en.GetDefaultAudioEndpoint(eRender, eMultimedia) {
+        if let Ok(def_info) = describe(&def) {
+            if !is_match(&def_info, &src_needle) {
+                shared.paused.store(true, Ordering::Relaxed);
+                shared.set_status(STATUS_IDLE);
+                let wake_raw = shared.wake_event.load(Ordering::Relaxed);
+                if wake_raw != 0 {
+                    let wake_handle = HANDLE(wake_raw as *mut _);
+                    let _ = WaitForSingleObject(wake_handle, 2000);
+                } else {
+                    thread::sleep(Duration::from_millis(500));
+                }
+                return Ok(());
+            }
+        }
+    }
+
     let (src, src_info) = match find(en, &src_needle)? {
         Found::One(d, info) => (d, info),
         _ => return Err(Error::from(E_FAIL)),
@@ -853,6 +923,10 @@ fn audio_thread(shared: Arc<Shared>) {
             Err(_) => return,
         };
 
+        let notifier: IMMNotificationClient =
+            DeviceNotifier { shared: Arc::clone(&shared) }.into();
+        let _ = en.RegisterEndpointNotificationCallback(&notifier);
+
         while !shared.quit.load(Ordering::Relaxed) {
             let _ = session(&en, &shared);
 
@@ -878,6 +952,7 @@ fn audio_thread(shared: Arc<Shared>) {
             }
         }
 
+        let _ = en.UnregisterEndpointNotificationCallback(&notifier);
         shared.set_status(STATUS_IDLE);
     }
 }
@@ -931,56 +1006,23 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
 
     let switched = set_default_audio_device(&next_device.1.id);
 
-    {
-        let mut src_guard = shared.src.lock().unwrap();
-        let mut src_name_guard = shared.src_name.lock().unwrap();
-        let mut dst_guard = shared.dst.lock().unwrap();
-        let mut dst_name_guard = shared.dst_name.lock().unwrap();
+    // Check if the newly selected default output device is our configured mirror source
+    let src_id = shared.src.lock().unwrap().clone();
+    let is_mirror_src = !src_id.is_empty() && next_device.1.id == src_id;
 
-        let is_dst = next_device.1.id == *dst_guard;
-        let is_src = next_device.1.id == *src_guard;
-
-        if is_dst {
-            // Switched to destination monitor in the mirror pair; swap them so
-            // the new default captures and mirrors to the other monitor.
-            mem::swap(&mut *src_guard, &mut *dst_guard);
-            mem::swap(&mut *src_name_guard, &mut *dst_name_guard);
-            shared.paused.store(false, Ordering::Relaxed);
-        } else if is_src {
-            // Switched to primary monitor in the mirror pair; unpause mirroring.
-            shared.paused.store(false, Ordering::Relaxed);
-        } else if src_guard.is_empty() {
-            // No mirror pair configured yet; make this the source.
-            *src_guard = next_device.1.id.clone();
-            *src_name_guard = next_device.1.name.clone();
-            shared.paused.store(false, Ordering::Relaxed);
-        } else {
-            // Switched to a standalone device (e.g. Headset) outside the mirror pair.
-            // Keep the monitor pair (src & dst) completely intact for when cycling back!
-            // Pause mirroring so audio plays EXCLUSIVELY through this standalone device.
-            shared.paused.store(true, Ordering::Relaxed);
-        }
-    }
-
-    save_current_settings(shared);
+    // Do NOT touch shared.src or shared.dst!
+    // If switched to the mirror source monitor, mirror is ACTIVE.
+    // If switched to headset or other device, mirror is PAUSED so monitors stay silent!
+    shared.paused.store(!is_mirror_src, Ordering::Relaxed);
     shared.restart.store(true, Ordering::Relaxed);
     shared.signal_wake();
 
     update_tooltip(hwnd, shared);
     if switched {
-        let balloon_msg = if shared.paused.load(Ordering::Relaxed) {
-            format!("Default: {}\n(Mirroring Paused)", next_device.1.name)
+        let balloon_msg = if is_mirror_src {
+            format!("Default: {}\n(Mirror Active)", next_device.1.name)
         } else {
-            let other_name = if next_device.1.id == *shared.src.lock().unwrap() {
-                shared.dst_name.lock().unwrap().clone()
-            } else {
-                shared.src_name.lock().unwrap().clone()
-            };
-            if !other_name.is_empty() {
-                format!("Default: {}\n(Mirrored with {})", next_device.1.name, trunc(&other_name, 25))
-            } else {
-                format!("Default: {}", next_device.1.name)
-            }
+            format!("Default: {}\n(Monitors Silent)", next_device.1.name)
         };
         show_balloon(shared, "Audio Output Switched", &balloon_msg);
     }
@@ -1662,13 +1704,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let mut items: Vec<Box<CustomMenuItem>> = Vec::new();
 
     // ── 1. SOURCE SECTION (BLUE) ──────────────────────────────────────────
-    let is_paused = shared.paused.load(Ordering::Relaxed);
-    let src_header_text = if is_paused {
-        "SOURCE (Standby - Mirror Paused)"
-    } else {
-        "SOURCE (Capture Output)"
-    };
-    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, src_header_text, "");
+    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, "SOURCE (Capture Output)", "");
     let current_src = shared.src.lock().unwrap().clone();
     for (i, (_dev, info)) in devices.iter().enumerate() {
         let is_chk = is_match(info, &current_src);
@@ -2000,11 +2036,7 @@ unsafe fn update_tooltip(hwnd: HWND, shared: &Shared) {
     };
 
     let tip = if is_paused {
-        if !src.is_empty() && !dst.is_empty() {
-            format!("⏸ Mirror Paused ({} + {} standby)", trunc(&src, 20), trunc(&dst, 20))
-        } else {
-            "⏸ Mirror Paused".to_string()
-        }
+        "⏸ Mirror Paused (Monitors Silent)".to_string()
     } else if src.is_empty() && dst.is_empty() {
         format!("{}Monitor Mirror (no devices selected)", status)
     } else {
@@ -2146,7 +2178,7 @@ fn main() {
             }
         }
 
-        // Detect if current Windows default audio device is in the mirror pair
+        // Detect if current Windows default audio device is our mirror source
         let initial_paused = if let Ok(en) =
             CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
         {
@@ -2158,18 +2190,9 @@ fn main() {
                 .map(|info| info.id);
 
             if let Some(ref cur_def) = def_id {
-                if !cfg.src.is_empty() && !cfg.dst.is_empty() {
-                    if cur_def == &cfg.dst {
-                        // Current default is destination monitor; swap so it matches source
-                        mem::swap(&mut cfg.src, &mut cfg.dst);
-                        mem::swap(&mut src_name, &mut dst_name);
-                        false
-                    } else if cur_def == &cfg.src {
-                        false
-                    } else {
-                        // Current default is a different device (e.g. Headset)
-                        true
-                    }
+                if !cfg.src.is_empty() {
+                    // Paused if default is not our mirror source (e.g. headset active)
+                    cur_def != &cfg.src
                 } else {
                     false
                 }

@@ -51,7 +51,7 @@ use windows::{
         },
         System::{
             Com::{
-                CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
                 StructuredStorage::PropVariantToStringAlloc, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
                 COINIT_MULTITHREADED, STGM_READ,
             },
@@ -63,8 +63,9 @@ use windows::{
                 REG_DWORD, REG_SZ,
             },
             Threading::{
-                AvSetMmThreadCharacteristicsW, CreateEventW, CreateMutexW, SetEvent,
-                WaitForMultipleObjects, WaitForSingleObject, INFINITE,
+                AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
+                CreateMutexW, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+                INFINITE,
             },
         },
         UI::{
@@ -123,27 +124,13 @@ impl IMMNotificationClient_Impl for DeviceNotifier_Impl {
             } else {
                 String::new()
             };
-            let is_src_opt = {
-                let resolved = self.shared.resolved_src_id.lock().unwrap();
-                let target = if !resolved.is_empty() {
-                    &*resolved
-                } else {
-                    &*self.shared.src.lock().unwrap()
-                };
-                if target.is_empty() {
-                    None
-                } else {
-                    Some(!def_str.is_empty() && def_str.eq_ignore_ascii_case(target))
-                }
-            };
-            if let Some(is_src) = is_src_opt {
+            if let Some(is_src) = self.shared.matches_target_src(&def_str) {
                 let new_paused = !is_src || self.shared.manual_paused.load(Ordering::Relaxed);
-                let prev_paused = self.shared.paused.swap(new_paused, Ordering::Relaxed);
+                let prev_paused = self.shared.paused.swap(new_paused, Ordering::Release);
                 // Only restart WASAPI & notify UI when active/paused state actually changes
                 // (avoids redundant restarts when eConsole and eMultimedia fire together).
                 if prev_paused != new_paused {
-                    self.shared.restart.store(true, Ordering::Relaxed);
-                    self.shared.signal_wake();
+                    self.shared.trigger_restart();
                     let hwnd_raw = self.shared.hwnd.load(Ordering::Relaxed);
                     if hwnd_raw != 0 {
                         unsafe {
@@ -475,6 +462,27 @@ impl Shared {
             hotkey_mod: AtomicU32::new(hotkey_mod),
             hotkey_vk: AtomicU32::new(hotkey_vk),
         })
+    }
+
+    /// Checks whether `endpoint_id` matches the configured mirror source (returns `None` if unconfigured).
+    fn matches_target_src(&self, endpoint_id: &str) -> Option<bool> {
+        let resolved = self.resolved_src_id.lock().unwrap();
+        if !resolved.is_empty() {
+            return Some(!endpoint_id.is_empty() && endpoint_id.eq_ignore_ascii_case(&resolved));
+        }
+        drop(resolved);
+
+        let src = self.src.lock().unwrap();
+        if src.is_empty() {
+            None
+        } else {
+            Some(!endpoint_id.is_empty() && endpoint_id.eq_ignore_ascii_case(&src))
+        }
+    }
+
+    fn trigger_restart(&self) {
+        self.restart.store(true, Ordering::Release);
+        self.signal_wake();
     }
 
     fn set_status(&self, s: u8) {
@@ -901,6 +909,19 @@ unsafe fn formats_equal(a: *const WAVEFORMATEX, b: *const WAVEFORMATEX) -> bool 
             == std::slice::from_raw_parts(b as *const u8, len_b)
 }
 
+/// Computes `(prime_silence_frames, copy_frames)` for a captured loopback packet.
+/// Adds `jitter_headroom` to `high` to prevent micro-clicks on early timer wakeups,
+/// while snapping drifted buffering back toward `cushion` whenever silent packets arrive.
+#[inline]
+fn compute_mirror_write(frames: u32, queued: u32, cushion: u32, high: u32, silent: bool) -> (u32, u32) {
+    let prime = if queued == 0 { cushion } else { 0 };
+    let mut n = frames.min(high.saturating_sub(queued + prime));
+    if silent && queued > cushion {
+        n = n.min((cushion + frames).saturating_sub(queued + prime));
+    }
+    (prime, n)
+}
+
 unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> {
     if shared.paused.load(Ordering::Relaxed) || shared.manual_paused.load(Ordering::Relaxed) {
         wait_while_paused(shared);
@@ -1062,11 +1083,25 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
 
         let period = ((rate as i64 * period_hns / 10_000_000) as u32).max(1);
         let cushion = ((rate as u64 * cushion_ms as u64 / 1000) as u32).max(1);
-        let high = (cushion + period).min(ring);
+        // +2 ms jitter headroom avoids truncating live audio when Windows fires slightly early
+        let jitter_headroom = (rate / 500).max(1);
+        let high = (cushion + period + jitter_headroom).min(ring);
 
         let wake_raw = shared.wake_event.load(Ordering::Relaxed);
         let wake_handle = HANDLE(wake_raw as *mut _);
         let wait_handles = [ev, wake_handle];
+
+        // Drain any stale wake signal accumulated during setup, then verify no state flags flipped
+        if !wake_handle.is_invalid() {
+            let _ = ResetEvent(wake_handle);
+        }
+        if shared.restart.load(Ordering::Acquire)
+            || shared.quit.load(Ordering::Acquire)
+            || shared.paused.load(Ordering::Acquire)
+            || shared.manual_paused.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
 
         dc.Start()?;
         sc.Start()?;
@@ -1076,8 +1111,8 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
             let w = WaitForMultipleObjects(&wait_handles, false, 1000);
 
             if w == windows::Win32::Foundation::WAIT_EVENT(WAIT_OBJECT_0.0 + 1)
-                || shared.restart.load(Ordering::Relaxed)
-                || shared.quit.load(Ordering::Relaxed)
+                || shared.restart.load(Ordering::Acquire)
+                || shared.quit.load(Ordering::Acquire)
             {
                 break;
             }
@@ -1091,13 +1126,8 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
                 cap.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
 
                 let queued = dc.GetCurrentPadding()?;
-                let prime = if queued == 0 { cushion } else { 0 };
                 let silent = (flags & BUFFERFLAGS_SILENT) != 0;
-                let mut n = frames.min(high.saturating_sub(queued + prime));
-                if silent && queued > cushion {
-                    // Snap any accumulated latency drift cleanly back to target cushion during silence
-                    n = n.min((cushion + frames).saturating_sub(queued + prime));
-                }
+                let (prime, n) = compute_mirror_write(frames, queued, cushion, high, silent);
                 let total = prime + n;
                 if total > 0 {
                     let out = rnd.GetBuffer(total)?;
@@ -1153,49 +1183,54 @@ unsafe fn show_balloon(shared: &Shared, title: &str, body: &str) {
 
 fn audio_thread(shared: Arc<Shared>) {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let co_init = CoInitializeEx(None, COINIT_MULTITHREADED);
 
         let mut task_idx = 0u32;
-        let _ = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_idx);
+        let avrt_handle = AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_idx).ok();
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
-        let en: IMMDeviceEnumerator = match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        if let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+            let notifier: IMMNotificationClient =
+                DeviceNotifier { shared: Arc::clone(&shared) }.into();
+            let _ = en.RegisterEndpointNotificationCallback(&notifier);
 
-        let notifier: IMMNotificationClient =
-            DeviceNotifier { shared: Arc::clone(&shared) }.into();
-        let _ = en.RegisterEndpointNotificationCallback(&notifier);
+            while !shared.quit.load(Ordering::Acquire) {
+                let _ = session(&en, &shared);
 
-        while !shared.quit.load(Ordering::Relaxed) {
-            let _ = session(&en, &shared);
+                if shared.quit.load(Ordering::Acquire) {
+                    break;
+                }
 
-            if shared.quit.load(Ordering::Relaxed) {
-                break;
+                if shared.restart.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
+
+                if shared.paused.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                shared.set_status(STATUS_WAITING);
+                let wake_raw = shared.wake_event.load(Ordering::Relaxed);
+                if wake_raw != 0 {
+                    let wake_handle = HANDLE(wake_raw as *mut _);
+                    let _ = WaitForSingleObject(wake_handle, 2000);
+                } else {
+                    thread::sleep(Duration::from_secs(2));
+                }
             }
 
-            if shared.restart.swap(false, Ordering::Relaxed) {
-                continue;
-            }
-
-            if shared.paused.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            shared.set_status(STATUS_WAITING);
-            let wake_raw = shared.wake_event.load(Ordering::Relaxed);
-            if wake_raw != 0 {
-                let wake_handle = HANDLE(wake_raw as *mut _);
-                let _ = WaitForSingleObject(wake_handle, 2000);
-            } else {
-                thread::sleep(Duration::from_secs(2));
-            }
+            let _ = en.UnregisterEndpointNotificationCallback(&notifier);
+            drop(notifier);
+            drop(en);
         }
 
-        let _ = en.UnregisterEndpointNotificationCallback(&notifier);
         shared.set_status(STATUS_IDLE);
+        if let Some(h) = avrt_handle {
+            let _ = AvRevertMmThreadCharacteristics(h);
+        }
+        if co_init.is_ok() {
+            CoUninitialize();
+        }
     }
 }
 
@@ -1245,23 +1280,14 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
     let switched = set_default_audio_device(&next_device.1.id);
 
     // Check if the newly selected default output device is our configured mirror source
-    let is_mirror_src = {
-        let resolved = shared.resolved_src_id.lock().unwrap();
-        let target = if !resolved.is_empty() {
-            &*resolved
-        } else {
-            &*shared.src.lock().unwrap()
-        };
-        !target.is_empty() && next_device.1.id.eq_ignore_ascii_case(target)
-    };
+    let is_mirror_src = shared.matches_target_src(&next_device.1.id).unwrap_or(false);
 
     // Do NOT touch shared.src or shared.dst!
     // If switched to the mirror source monitor (and not manually paused), mirror is ACTIVE.
     // If switched to headset or other device, mirror is PAUSED so monitors stay silent!
     let new_paused = !is_mirror_src || shared.manual_paused.load(Ordering::Relaxed);
-    shared.paused.store(new_paused, Ordering::Relaxed);
-    shared.restart.store(true, Ordering::Relaxed);
-    shared.signal_wake();
+    shared.paused.store(new_paused, Ordering::Release);
+    shared.trigger_restart();
 
     update_tooltip(hwnd, shared);
     if switched {
@@ -1794,10 +1820,15 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
             w!("Segoe UI"),
         );
         font_ptr = new_font.0;
-        font_slot.store(font_ptr, Ordering::Relaxed);
+        if !font_ptr.is_null() {
+            font_slot.store(font_ptr, Ordering::Relaxed);
+        }
     }
-    let font = HFONT(font_ptr);
-    let old_font = SelectObject(hdc, font.into());
+    let old_font = if !font_ptr.is_null() {
+        Some(SelectObject(hdc, HFONT(font_ptr).into()))
+    } else {
+        None
+    };
 
     // Left accent pill
     let pill_w = (4.0 * scale).max(3.0) as i32;
@@ -1903,7 +1934,9 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
         );
     }
 
-    SelectObject(hdc, old_font);
+    if let Some(prev) = old_font {
+        SelectObject(hdc, prev);
+    }
 }
 
 fn get_hotkey_description(mod_code: u32, vk: u32) -> String {
@@ -2186,8 +2219,11 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let _ = DestroyMenu(hk_menu);
     let _ = DestroyMenu(menu);
 
-    // Trim cold menu pages from working set immediately after menu closes
-    SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    // Only trim working set on menu close when not actively streaming audio,
+    // avoiding soft page faults on the real-time Pro Audio thread.
+    if shared.paused.load(Ordering::Relaxed) || shared.status.load(Ordering::Relaxed) != STATUS_ACTIVE {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
 }
 
 fn is_match(info: &DeviceInfo, needle: &str) -> bool {
@@ -2201,6 +2237,22 @@ fn is_match(info: &DeviceInfo, needle: &str) -> bool {
     info.name.to_lowercase().contains(&n) || info.id.to_lowercase().contains(&n)
 }
 
+unsafe fn resolve_menu_device(idx: usize) -> Option<DeviceInfo> {
+    LAST_MENU_DEVICES
+        .lock()
+        .unwrap()
+        .get(idx)
+        .cloned()
+        .or_else(|| {
+            with_ui_enumerator(|en| {
+                enumerate_devices(en)
+                    .ok()
+                    .and_then(|devs| devs.get(idx).map(|d| d.1.clone()))
+            })
+            .flatten()
+        })
+}
+
 unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
     let p = GLOBAL_SHARED.load(Ordering::Relaxed);
     if p.is_null() {
@@ -2210,7 +2262,7 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
 
     match id {
         IDM_EXIT => {
-            shared.quit.store(true, Ordering::Relaxed);
+            shared.quit.store(true, Ordering::Release);
             shared.signal_wake();
             remove_tray_icon(hwnd);
             let _ = DestroyWindow(hwnd);
@@ -2223,32 +2275,22 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
             let next = !prev;
             shared.vol_sync.store(next, Ordering::Relaxed);
             save_current_settings(shared);
-            shared.restart.store(true, Ordering::Relaxed);
-            shared.signal_wake();
+            shared.trigger_restart();
         }
         IDM_PAUSE_MIRROR => {
             let next_manual = !shared.manual_paused.load(Ordering::Relaxed);
-            shared.manual_paused.store(next_manual, Ordering::Relaxed);
+            shared.manual_paused.store(next_manual, Ordering::Release);
             if next_manual {
-                shared.paused.store(true, Ordering::Relaxed);
+                shared.paused.store(true, Ordering::Release);
             } else {
                 // Resume only if current Windows default output matches mirror source
                 let is_src = with_ui_enumerator(|en| default_device_id(en))
                     .flatten()
-                    .map(|def| {
-                        let resolved = shared.resolved_src_id.lock().unwrap();
-                        let target = if !resolved.is_empty() {
-                            &*resolved
-                        } else {
-                            &*shared.src.lock().unwrap()
-                        };
-                        !target.is_empty() && def.eq_ignore_ascii_case(target)
-                    })
+                    .and_then(|def| shared.matches_target_src(&def))
                     .unwrap_or(false);
-                shared.paused.store(!is_src, Ordering::Relaxed);
+                shared.paused.store(!is_src, Ordering::Release);
             }
-            shared.restart.store(true, Ordering::Relaxed);
-            shared.signal_wake();
+            shared.trigger_restart();
             update_tooltip(hwnd, shared);
         }
         IDM_CYCLE_DEVICE => {
@@ -2261,10 +2303,9 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
         }
         _ if id >= IDM_CUSHION_BASE && id <= IDM_CUSHION_END => {
             if let Some(&(_, ms, _)) = CUSHION_PRESETS.iter().find(|&&(cid, _, _)| cid == id) {
-                shared.cushion_ms.store(ms, Ordering::Relaxed);
+                shared.cushion_ms.store(ms, Ordering::Release);
                 save_current_settings(shared);
-                shared.restart.store(true, Ordering::Relaxed);
-                shared.signal_wake();
+                shared.trigger_restart();
                 update_tooltip(hwnd, shared);
             }
         }
@@ -2304,15 +2345,7 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
 }
 
 unsafe fn toggle_favorite(shared: &Shared, idx: usize) {
-    let info_opt = LAST_MENU_DEVICES.lock().unwrap().get(idx).cloned().or_else(|| {
-        with_ui_enumerator(|en| {
-            enumerate_devices(en)
-                .ok()
-                .and_then(|devs| devs.get(idx).map(|d| d.1.clone()))
-        })
-        .flatten()
-    });
-    if let Some(info) = info_opt {
+    if let Some(info) = resolve_menu_device(idx) {
         let mut favs = shared.favorites.lock().unwrap();
         if favs.contains(&info.id) {
             favs.remove(&info.id);
@@ -2337,34 +2370,26 @@ unsafe fn save_current_settings(shared: &Shared) {
 }
 
 unsafe fn select_device(shared: &Shared, is_src: bool, idx: usize) {
-    let info_opt = LAST_MENU_DEVICES.lock().unwrap().get(idx).cloned().or_else(|| {
-        with_ui_enumerator(|en| {
-            enumerate_devices(en)
-                .ok()
-                .and_then(|devs| devs.get(idx).map(|d| d.1.clone()))
-        })
-        .flatten()
-    });
-    if let Some(info) = info_opt {
+    if let Some(info) = resolve_menu_device(idx) {
         if is_src {
             *shared.src.lock().unwrap() = info.id.clone();
             *shared.resolved_src_id.lock().unwrap() = info.id.clone();
             *shared.src_name.lock().unwrap() = info.name;
             set_default_audio_device(&info.id);
-            shared.manual_paused.store(false, Ordering::Relaxed);
-            shared.paused.store(false, Ordering::Relaxed);
+            shared.manual_paused.store(false, Ordering::Release);
+            shared.paused.store(false, Ordering::Release);
         } else {
             *shared.dst.lock().unwrap() = info.id;
             *shared.dst_name.lock().unwrap() = info.name;
             if let Some(Some(def_id)) = with_ui_enumerator(|en| default_device_id(en)) {
-                let src_id = shared.src.lock().unwrap().clone();
-                if !src_id.is_empty() && def_id.eq_ignore_ascii_case(&src_id) && !shared.manual_paused.load(Ordering::Relaxed) {
-                    shared.paused.store(false, Ordering::Relaxed);
+                if shared.matches_target_src(&def_id).unwrap_or(false)
+                    && !shared.manual_paused.load(Ordering::Relaxed)
+                {
+                    shared.paused.store(false, Ordering::Release);
                 }
             }
         }
-        shared.restart.store(true, Ordering::Relaxed);
-        shared.signal_wake();
+        shared.trigger_restart();
     }
 }
 
@@ -2507,6 +2532,17 @@ fn fatal(msg: &str) -> ! {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+struct ComGuard(bool);
+
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        UI_ENUMERATOR.with(|cell| *cell.borrow_mut() = None);
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 fn main() {
     unsafe {
         // Enable native Per-Monitor V2 DPI awareness: prevents any blur or bitmap scaling on high-DPI displays!
@@ -2515,7 +2551,7 @@ fn main() {
         // Enable Windows 10/11 Dark Mode for Win32 menus: eliminates the white border!
         enable_dark_mode();
 
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _com_guard = ComGuard(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());
 
         let (do_list, mut cfg) = parse();
 
@@ -2661,11 +2697,11 @@ fn main() {
 
         // Cleanup and graceful exit
         let _ = UnregisterHotKey(Some(hwnd), HOTKEY_CYCLE_ID);
-        shared.quit.store(true, Ordering::Relaxed);
+        shared.quit.store(true, Ordering::Release);
         shared.signal_wake();
         let _ = audio_handle.join();
+        GLOBAL_SHARED.store(ptr::null_mut(), Ordering::SeqCst);
         let _ = CloseHandle(wake_event);
-        UI_ENUMERATOR.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -2702,5 +2738,58 @@ mod tests {
         assert_eq!(get_hotkey_description(MOD_CONTROL.0 | MOD_ALT.0, 0x41), "Ctrl+Alt+A");
         assert_eq!(trunc("Short", 10), "Short");
         assert_eq!(trunc("LongDeviceName", 4), "Long…");
+    }
+
+    #[test]
+    fn mirror_write_math_handles_startup_jitter_overflow_and_silence() {
+        // 48 kHz, 10 ms period (480), 3 ms cushion (144), +2 ms jitter headroom (96) -> high = 720
+        let (period, cushion, high) = (480, 144, 720);
+
+        // 1. Cold start (queued == 0) primes cushion + copies full packet
+        assert_eq!(compute_mirror_write(period, 0, cushion, high, false), (144, 480));
+
+        // 2. Steady state (queued == cushion) copies full packet with no extra prime
+        assert_eq!(compute_mirror_write(period, 144, cushion, high, false), (0, 480));
+
+        // 3. Early wakeup (+1.5 ms jitter above cushion) does NOT drop live audio frames
+        assert_eq!(compute_mirror_write(period, 216, cushion, high, false), (0, 480));
+
+        // 4. Genuine drift above high caps cleanly
+        assert_eq!(compute_mirror_write(period, 300, cushion, high, false), (0, 420));
+
+        // 5. Silent packet trims drift back so post-drain queued settles at cushion (216 + 408 - 480 = 144)
+        assert_eq!(compute_mirror_write(period, 216, cushion, high, true), (0, 408));
+    }
+
+    #[test]
+    fn formats_equal_compares_waveformat_cleanly() {
+        let wf1 = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: 2,
+            nSamplesPerSec: 48000,
+            nAvgBytesPerSec: 192000,
+            nBlockAlign: 4,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        let mut wf2 = wf1;
+        unsafe {
+            assert!(formats_equal(&wf1, &wf2));
+            wf2.nSamplesPerSec = 44100;
+            assert!(!formats_equal(&wf1, &wf2));
+        }
+    }
+
+    #[test]
+    fn custom_menu_item_preencodes_utf16_and_updates() {
+        let mut item = CustomMenuItem::new(1, MenuItemKind::FavoritesHeader, true, "★ Favorites", "▶");
+        assert_eq!(item.text_len, 11);
+        assert_eq!(item.text_u16.len(), 11);
+        assert_eq!(item.shortcut_len, 1);
+        item.set_text("★ Favorites (None set)");
+        item.set_shortcut("");
+        assert_eq!(item.text_len, 22);
+        assert_eq!(item.shortcut_len, 0);
+        assert!(item.shortcut_u16.is_empty());
     }
 }

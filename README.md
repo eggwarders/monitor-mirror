@@ -30,7 +30,7 @@
 - **🪶 Ultra-Light Footprint**:
   - **Memory**: ~2.5 MB Working Set (~1.8 MB Private Bytes) — native `user32` PNG decoding (no `gdiplus.dll` / `shlwapi.dll`), zero-CPU `INFINITE` idle wait when paused, and automatic working set trimming.
   - **CPU**: 0.00% when idle or paused; microsecond DMA copies during playback.
-  - **Binary**: ~290 KB standalone native executable with embedded 256×256 icon and zero external runtime dependencies.
+  - **Binary**: ~272 KB standalone native executable with embedded 256×256 icon and zero external runtime dependencies.
 - **🚀 Start with Windows**: One-click startup toggle persisted in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
 - **🛡️ Auto-Pause & Self-Mirror Protection**: Automatically pauses mirroring (zero active streams, monitors silent) when Windows default audio switches to your headset or another non-source endpoint.
 

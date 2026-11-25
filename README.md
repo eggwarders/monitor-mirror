@@ -13,23 +13,26 @@
 
 ## Features
 
-- **⚡ Ultra-Low Latency WASAPI Loopback Engine**: Event-driven streaming with adaptive 3 ms cushions and 15 ms ring buffers. Down to zero perceptible audio delay.
-- **🎧 Sound Switch / Device Cycling via Global Hotkey**: Cycle between your Windows audio playback devices instantly with a customizable hotkey (default: `Ctrl + Alt + A`).
-- **⭐ Audio Device Favorites**: Mark preferred audio devices as Favorites (`★`). The hotkey will cycle exclusively between your favorited devices, or across all active devices if none are set.
+- **⚡ Ultra-Low Latency WASAPI Loopback Engine**:
+  - Configurable latency cushion right from the menu (`1 ms` Ultra-Low up to `10 ms` Buffered, default `3 ms`).
+  - Direct PCM pass-through (bypasses Windows Audio Resampler MFT when source and destination formats match).
+  - Zero-copy silence handling (`AUDCLNT_BUFFERFLAGS_SILENT`) + automatic drift centering during silent gaps.
+- **🎧 Sound Switch / Device Cycling via Global Hotkey & Middle-Click**: Cycle between your Windows audio playback devices instantly with a customizable hotkey (default: `Ctrl + Alt + A`) or by middle-clicking the tray icon.
+- **⭐ Audio Device Favorites**: Mark preferred audio devices as Favorites (`★`). The hotkey cycles exclusively between your favorited devices, or across all active devices if fewer than 2 are starred.
 - **🎨 Color-Coded Native System Tray Menu**:
-  - <span style="color:#3B82F6"><b>Blue Section</b></span>: Audio Source (capture device).
+  - <span style="color:#3B82F6"><b>Blue Section</b></span>: Audio Source (capture device) with live status badge (`● ACTIVE`, `⏸ PAUSED`, `⏳ WAITING`) and active Windows `Default` indicator.
   - <span style="color:#EF4444"><b>Red Section</b></span>: Audio Destination (mirror target).
-  - <span style="color:#CBD5E1"><b>Silver Accent</b></span>: Real-time Master & Per-Channel Volume Synchronization.
+  - <span style="color:#CBD5E1"><b>Silver Accent</b></span>: Master & Per-Channel Volume Synchronization + Latency Cushion selector.
   - <span style="color:#06B6D4"><b>Cyan Accent</b></span>: Instant Sound Switch with hotkey indicator.
-  - <span style="color:#F59E0B"><b>Gold Accent</b></span>: Starred Favorites submenu (stays open on click for seamless toggling).
-- **🖥️ Per-Monitor V2 High-DPI & Dark Mode**: True native High-DPI font rendering with ClearType for 4K / 1440p displays, complete with dark frame theme integration (no white outlines).
+  - <span style="color:#F59E0B"><b>Gold Accent</b></span>: Starred Favorites submenu (stays open on click for seamless toggling) + manual Pause toggle.
+- **🖥️ Per-Monitor V2 High-DPI & Dark Mode**: Native High-DPI ClearType rendering cached per-DPI with zero GDI handle churn and dark non-client frame integration (no white outlines).
 - **🔊 Volume Synchronization**: Hardware volume keys or taskbar adjustments on the primary device mirror instantly to the secondary output (including left/right channel balance).
-- **🪶 Tiny Footprint**:
-  - **Memory**: ~3.5 MB RAM (automatic working set trimming).
-  - **CPU**: 0.00% when idle; microsecond DMA copies during playback.
-  - **Binary**: ~260 KB standalone native executable with embedded icon and zero external runtime dependencies.
+- **🪶 Ultra-Light Footprint**:
+  - **Memory**: ~2.5 MB Working Set (~1.8 MB Private Bytes) — native `user32` PNG decoding (no `gdiplus.dll` / `shlwapi.dll`), zero-CPU `INFINITE` idle wait when paused, and automatic working set trimming.
+  - **CPU**: 0.00% when idle or paused; microsecond DMA copies during playback.
+  - **Binary**: ~290 KB standalone native executable with embedded 256×256 icon and zero external runtime dependencies.
 - **🚀 Start with Windows**: One-click startup toggle persisted in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
-- **🛡️ Auto-Avoid Self-Mirroring**: Automatically resolves endpoint collisions when switching audio outputs to prevent audio feedback loops.
+- **🛡️ Auto-Pause & Self-Mirror Protection**: Automatically pauses mirroring (zero active streams, monitors silent) when Windows default audio switches to your headset or another non-source endpoint.
 
 ---
 
@@ -49,15 +52,17 @@ Pressing the hotkey switches the Windows default audio playback device (Console,
 
 ## System Tray Menu Overview
 
-Right-click the **Monitor Mirror** tray icon to access:
-1. **Source** (<span style="color:#3B82F6">Blue</span>): Select the primary audio device being captured.
+Right-click (or left-click) the **Monitor Mirror** tray icon to access (or middle-click to cycle output):
+1. **Source** (<span style="color:#3B82F6">Blue</span>): Select the primary audio device being captured; shows live mirror state (`ACTIVE`, `PAUSED`, `WAITING`) and Windows `Default` device badge.
 2. **Destination** (<span style="color:#EF4444">Red</span>): Select the target endpoint where audio is mirrored.
 3. **Cycle Audio Output** (<span style="color:#06B6D4">Cyan</span>): Manually trigger device cycling.
-4. **Favorites** (<span style="color:#F59E0B">Gold</span>): Star devices to restrict hotkey cycling to your favorite outputs.
+4. **Favorites** (<span style="color:#F59E0B">Gold</span>): Star devices to restrict hotkey cycling to your favorite outputs (menu stays open while toggling).
 5. **Switch Hotkey**: Choose your preferred global hotkey combination.
-6. **Volume Synchronization** (<span style="color:#CBD5E1">Silver</span>): Toggle master and balance sync.
-7. **Start with Windows**: Enable or disable launch at login.
-8. **Exit**: Gracefully teardown WASAPI audio streams and exit.
+6. **Latency Cushion**: Tune mirror buffer cushion live between `1 ms` and `10 ms` (persisted across restarts).
+7. **Pause Mirroring**: Manually pause/resume mirroring without changing your Windows default device.
+8. **Volume Synchronization** (<span style="color:#CBD5E1">Silver</span>): Toggle master and balance sync.
+9. **Start with Windows**: Enable or disable launch at login.
+10. **Exit**: Gracefully teardown WASAPI audio streams and exit.
 
 ---
 

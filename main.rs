@@ -1,13 +1,13 @@
-// monitor-mirror v0.4.1: Ultra-low latency audio mirroring between WASAPI endpoints,
+// monitor-mirror v0.5.0: Ultra-low latency audio mirroring between WASAPI endpoints,
 // featuring a system-tray UI with color-coded dark menus, embedded high-DPI logo icon,
 // audio device cycling (SoundSwitch feature) via customizable hotkeys, and non-dismissing favorites.
 //
 // Subsystem: Windows (no console window).
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
-#![allow(dead_code)]
 
 use std::{
+    cell::RefCell,
     collections::HashSet,
     ffi::c_void,
     io::Write,
@@ -26,20 +26,15 @@ use windows::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{
             CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HWND,
-            LPARAM, LRESULT, POINT, PROPERTYKEY, RECT, WAIT_TIMEOUT, WPARAM,
+            LPARAM, LRESULT, POINT, PROPERTYKEY, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
         },
-        Graphics::{
-            Gdi::{
-                CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, InvalidateRect,
-                SelectObject, SetBkMode, SetTextColor, ScreenToClient, UpdateWindow, DT_LEFT,
-                DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FONT_CHARSET, FONT_CLIP_PRECISION,
-                FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HMONITOR,
-                MONITOR_DEFAULTTONEAREST, MonitorFromPoint, TRANSPARENT,
-            },
-            GdiPlus::{
-                GdiplusStartup, GdiplusStartupInput, GdipCreateBitmapFromStream,
-                GdipCreateHICONFromBitmap, GdipDisposeImage,
-            },
+        Graphics::Gdi::{
+            CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject,
+            InvalidateRect, ScreenToClient, SelectObject, SetBkMode, SetDCBrushColor, SetTextColor,
+            UpdateWindow, DC_BRUSH, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+            FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, FW_BOLD,
+            FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
+            MonitorFromPoint, TRANSPARENT,
         },
         Media::Audio::{
             eConsole, eMultimedia, eRender, EDataFlow, ERole, DEVICE_STATE,
@@ -48,11 +43,11 @@ use windows::{
                 IAudioEndpointVolumeCallback_Impl,
             },
             IAudioCaptureClient, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-            IMMNotificationClient, IMMNotificationClient_Impl,
-            MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
+            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIO_VOLUME_NOTIFICATION_DATA,
-            DEVICE_STATE_ACTIVE,
+            DEVICE_STATE_ACTIVE, WAVEFORMATEX,
         },
         System::{
             Com::{
@@ -69,7 +64,7 @@ use windows::{
             },
             Threading::{
                 AvSetMmThreadCharacteristicsW, CreateEventW, CreateMutexW, SetEvent,
-                WaitForMultipleObjects, WaitForSingleObject,
+                WaitForMultipleObjects, WaitForSingleObject, INFINITE,
             },
         },
         UI::{
@@ -78,21 +73,22 @@ use windows::{
                 MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, VK_F11, VK_SCROLL,
             },
             Shell::{
-                Shell_NotifyIconW, SHCreateMemStream, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
-                NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_INFOTIP_FLAGS,
+                Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                NIM_MODIFY, NOTIFYICONDATAW, NOTIFY_ICON_INFOTIP_FLAGS,
             },
             WindowsAndMessaging::{
-                AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-                DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW, GetCursorPos, GetMessageW,
-                GetWindowLongPtrW, LoadIconW, MenuItemFromPoint, MessageBoxW, PostMessageW,
-                PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
-                SetWindowPos, SetWindowsHookExW, TrackPopupMenu, TranslateMessage,
-                UnhookWindowsHookEx, GWL_EXSTYLE, HHOOK, HICON, HMENU, IDI_APPLICATION,
-                MENU_ITEM_FLAGS, MF_OWNERDRAW, MF_POPUP, MF_SEPARATOR, MB_ICONERROR, MB_OK, MSG,
-                SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-                TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WH_MSGFILTER,
-                WM_APP, WM_COMMAND, WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_INITMENUPOPUP,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+                AppendMenuW, CallNextHookEx, CreateIconFromResourceEx, CreatePopupMenu,
+                CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+                DispatchMessageW, FindWindowExW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+                LoadIconW, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
+                RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+                SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+                GWL_EXSTYLE, HHOOK, HICON, HMENU, IDI_APPLICATION, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS,
+                MF_OWNERDRAW, MF_POPUP, MF_SEPARATOR, MB_ICONERROR, MB_OK, MSG, SWP_FRAMECHANGED,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, TPM_BOTTOMALIGN,
+                TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WH_MSGFILTER, WM_APP, WM_COMMAND,
+                WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_INITMENUPOPUP, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MBUTTONUP, WM_MEASUREITEM, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
                 WS_EX_DLGMODALFRAME, WS_EX_WINDOWEDGE, WS_POPUP,
             },
         },
@@ -127,16 +123,37 @@ impl IMMNotificationClient_Impl for DeviceNotifier_Impl {
             } else {
                 String::new()
             };
-            let src_id = self.shared.src.lock().unwrap().clone();
-            if !src_id.is_empty() {
-                let is_src = !def_str.is_empty() && def_str.eq_ignore_ascii_case(&src_id);
-                self.shared.paused.store(!is_src, Ordering::Relaxed);
-                self.shared.restart.store(true, Ordering::Relaxed);
-                self.shared.signal_wake();
-                let hwnd_raw = self.shared.hwnd.load(Ordering::Relaxed);
-                if hwnd_raw != 0 {
-                    unsafe {
-                        update_tooltip(HWND(hwnd_raw as *mut _), &self.shared);
+            let is_src_opt = {
+                let resolved = self.shared.resolved_src_id.lock().unwrap();
+                let target = if !resolved.is_empty() {
+                    &*resolved
+                } else {
+                    &*self.shared.src.lock().unwrap()
+                };
+                if target.is_empty() {
+                    None
+                } else {
+                    Some(!def_str.is_empty() && def_str.eq_ignore_ascii_case(target))
+                }
+            };
+            if let Some(is_src) = is_src_opt {
+                let new_paused = !is_src || self.shared.manual_paused.load(Ordering::Relaxed);
+                let prev_paused = self.shared.paused.swap(new_paused, Ordering::Relaxed);
+                // Only restart WASAPI & notify UI when active/paused state actually changes
+                // (avoids redundant restarts when eConsole and eMultimedia fire together).
+                if prev_paused != new_paused {
+                    self.shared.restart.store(true, Ordering::Relaxed);
+                    self.shared.signal_wake();
+                    let hwnd_raw = self.shared.hwnd.load(Ordering::Relaxed);
+                    if hwnd_raw != 0 {
+                        unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_raw as *mut _)),
+                                WM_STATUS_UPDATE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
                     }
                 }
             }
@@ -148,9 +165,6 @@ impl IMMNotificationClient_Impl for DeviceNotifier_Impl {
     }
 }
 
-
-
-
 #[link(name = "kernel32")]
 extern "system" {
     fn SetProcessWorkingSetSize(hProcess: *mut c_void, dwMinimumWorkingSetSize: usize, dwMaximumWorkingSetSize: usize) -> i32;
@@ -160,10 +174,10 @@ extern "system" {
     fn SetThreadPriority(hThread: *mut c_void, nPriority: i32) -> i32;
 }
 
+#[allow(dead_code)]
 #[link(name = "user32")]
 extern "system" {
     fn SetProcessDpiAwarenessContext(value: isize) -> i32;
-    fn GetDpiForWindow(hwnd: HWND) -> u32;
     fn SetMenuInfo(hMenu: HMENU, lpcmi: *const MENUINFO) -> windows::core::BOOL;
     fn FindWindowW(lpClassName: PCWSTR, lpWindowName: PCWSTR) -> HWND;
 }
@@ -175,7 +189,6 @@ extern "system" {
 
 const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
-const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 
 // ─── Embedded Logo Asset (High-DPI 256x256 optimized for tray) ───────────────
 
@@ -190,6 +203,7 @@ const IID_POLICY_CONFIG: windows::core::GUID =
 const IID_POLICY_CONFIG_VISTA: windows::core::GUID =
     windows::core::GUID::from_u128(0x568b9108_44bf_40b4_9006_86afe5b5a620);
 
+#[allow(dead_code)]
 #[repr(C)]
 struct IPolicyConfigVtbl {
     pub parent: windows_core::IUnknown_Vtbl,
@@ -221,6 +235,7 @@ extern "system" {
 
 // ─── Owner-Drawn Menu Structs & Constants ───────────────────────────────────
 
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MEASUREITEMSTRUCT {
@@ -232,6 +247,7 @@ pub struct MEASUREITEMSTRUCT {
     pub itemData: usize,
 }
 
+#[allow(dead_code)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DRAWITEMSTRUCT {
@@ -264,10 +280,10 @@ pub const ODT_MENU: u32 = 1;
 pub const ODS_SELECTED: u32 = 0x0001;
 pub const ODS_GRAYED: u32 = 0x0002;
 pub const ODS_DISABLED: u32 = 0x0004;
-pub const ODS_CHECKED: u32 = 0x0008;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+const APP_VERSION: &str = "0.5.0";
 const BUFFERFLAGS_SILENT: u32 = 0x2;
 
 /// Custom message the tray icon posts to our hidden window.
@@ -284,8 +300,9 @@ const IDM_AUTOSTART: u16 = 2;
 const IDM_VOLSYNC: u16 = 3;
 const IDM_CYCLE_DEVICE: u16 = 4;
 const IDM_CLEAR_FAVORITES: u16 = 5;
+const IDM_PAUSE_MIRROR: u16 = 6;
 
-// Hotkey preset IDs (10 .. 19)
+// Hotkey preset IDs (10 .. 15)
 const IDM_HOTKEY_BASE: u16 = 10;
 const IDM_HOTKEY_CTRL_ALT_A: u16 = 10;
 const IDM_HOTKEY_CTRL_SHIFT_A: u16 = 11;
@@ -293,6 +310,17 @@ const IDM_HOTKEY_CTRL_ALT_S: u16 = 12;
 const IDM_HOTKEY_WIN_ALT_A: u16 = 13;
 const IDM_HOTKEY_F11: u16 = 14;
 const IDM_HOTKEY_SCROLL: u16 = 15;
+
+// Latency cushion preset IDs (20 .. 24)
+const IDM_CUSHION_BASE: u16 = 20;
+const IDM_CUSHION_END: u16 = 24;
+const CUSHION_PRESETS: &[(u16, u32, &str)] = &[
+    (20, 1, "1 ms (Ultra-Low)"),
+    (21, 2, "2 ms (Low)"),
+    (22, 3, "3 ms (Balanced)"),
+    (23, 5, "5 ms (Safe)"),
+    (24, 10, "10 ms (Buffered)"),
+];
 
 const IDM_SRC_BASE: u16 = 1000; // source devices    1000 .. 1999
 const IDM_DST_BASE: u16 = 2000; // dest devices      2000 .. 2999
@@ -324,6 +352,7 @@ const CLR_SILVER_ACCENT: COLORREF = COLORREF(0x00E1D5CB);// #CBD5E1 metallic pla
 const CLR_CYAN_ACCENT: COLORREF = COLORREF(0x00D4B606); // #06B6D4 vibrant cyan/teal
 const CLR_GOLD_ACCENT: COLORREF = COLORREF(0x000B9EF5); // #F59E0B gold star
 const CLR_EXIT_ACCENT: COLORREF = COLORREF(0x007171F8); // #F87171 soft coral
+const CLR_GREEN_ACCENT: COLORREF = COLORREF(0x0081B910);// #10B981 active status green
 
 // ─── Menu Item Metadata for Owner-Draw ───────────────────────────────────────
 
@@ -338,6 +367,8 @@ enum MenuItemKind {
     ItemFavorite,
     ClearFavorites,
     HotkeyOption,
+    CushionOption,
+    PauseMirror,
     VolumeSync,
     AutoStart,
     Exit,
@@ -348,8 +379,37 @@ struct CustomMenuItem {
     id: u16,
     kind: MenuItemKind,
     checked: bool,
-    text: String,
-    shortcut: String,
+    disabled: bool,
+    text_len: usize,
+    shortcut_len: usize,
+    text_u16: Vec<u16>,
+    shortcut_u16: Vec<u16>,
+}
+
+impl CustomMenuItem {
+    fn new(id: u16, kind: MenuItemKind, checked: bool, text: &str, shortcut: &str) -> Self {
+        let disabled = matches!(kind, MenuItemKind::HeaderSource | MenuItemKind::HeaderDest);
+        Self {
+            id,
+            kind,
+            checked,
+            disabled,
+            text_len: text.chars().count(),
+            shortcut_len: shortcut.chars().count(),
+            text_u16: text.encode_utf16().collect(),
+            shortcut_u16: shortcut.encode_utf16().collect(),
+        }
+    }
+
+    fn set_text(&mut self, text: &str) {
+        self.text_len = text.chars().count();
+        self.text_u16 = text.encode_utf16().collect();
+    }
+
+    fn set_shortcut(&mut self, shortcut: &str) {
+        self.shortcut_len = shortcut.chars().count();
+        self.shortcut_u16 = shortcut.encode_utf16().collect();
+    }
 }
 
 // ─── Shared state ────────────────────────────────────────────────────────────
@@ -362,6 +422,7 @@ struct DeviceInfo {
 
 struct Shared {
     src: Mutex<String>,
+    resolved_src_id: Mutex<String>,
     src_name: Mutex<String>,
     dst: Mutex<String>,
     dst_name: Mutex<String>,
@@ -369,6 +430,7 @@ struct Shared {
     restart: AtomicBool,
     quit: AtomicBool,
     paused: AtomicBool,
+    manual_paused: AtomicBool,
     vol_sync: AtomicBool,
     wake_event: AtomicUsize,
     status: AtomicU8,
@@ -395,6 +457,7 @@ impl Shared {
     ) -> Arc<Self> {
         Arc::new(Self {
             src: Mutex::new(src),
+            resolved_src_id: Mutex::new(String::new()),
             src_name: Mutex::new(src_name),
             dst: Mutex::new(dst),
             dst_name: Mutex::new(dst_name),
@@ -402,6 +465,7 @@ impl Shared {
             restart: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             paused: AtomicBool::new(paused),
+            manual_paused: AtomicBool::new(false),
             vol_sync: AtomicBool::new(vol_sync),
             wake_event: AtomicUsize::new(wake_event),
             status: AtomicU8::new(STATUS_IDLE),
@@ -414,16 +478,17 @@ impl Shared {
     }
 
     fn set_status(&self, s: u8) {
-        self.status.store(s, Ordering::Relaxed);
-        let h = self.hwnd.load(Ordering::Relaxed);
-        if h != 0 {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(h as *mut _)),
-                    WM_STATUS_UPDATE,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+        if self.status.swap(s, Ordering::Relaxed) != s {
+            let h = self.hwnd.load(Ordering::Relaxed);
+            if h != 0 {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(h as *mut _)),
+                        WM_STATUS_UPDATE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
             }
         }
     }
@@ -462,10 +527,34 @@ unsafe fn enable_dark_mode() {
     }
 }
 
+static DARK_STYLED_HWNDS: [AtomicIsize; 3] = [
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+    AtomicIsize::new(0),
+];
+
+fn reset_dark_styled_hwnds() {
+    for slot in &DARK_STYLED_HWNDS {
+        slot.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Applies immersive dark mode, dark borders, and strips white non-client frames from Win32 menus
 unsafe fn apply_menu_dark_mode(hwnd: HWND) {
     if hwnd.is_invalid() || hwnd.0.is_null() {
         return;
+    }
+
+    let raw = hwnd.0 as isize;
+    for slot in &DARK_STYLED_HWNDS {
+        let cur = slot.load(Ordering::Relaxed);
+        if cur == raw {
+            return; // Already styled during this popup session
+        }
+        if cur == 0 {
+            slot.store(raw, Ordering::Relaxed);
+            break;
+        }
     }
 
     // 1. Opt-in menu window to Dark Mode via uxtheme
@@ -499,44 +588,69 @@ unsafe fn apply_menu_dark_mode(hwnd: HWND) {
     }
 }
 
-/// Retrieves the exact physical DPI of the monitor containing the given screen point
+/// Retrieves the exact physical DPI of the monitor containing the given screen point.
+/// Caches the GetDpiForMonitor function pointer to avoid repeated LoadLibrary/GetProcAddress calls.
 unsafe fn get_dpi_for_screen_point(pt: POINT) -> u32 {
+    static DPI_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static DPI_FN_INIT: AtomicBool = AtomicBool::new(false);
+
+    type FnGetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> windows_core::HRESULT;
+
     let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    if !mon.0.is_null() {
-        type FnGetDpiForMonitor = unsafe extern "system" fn(HMONITOR, i32, *mut u32, *mut u32) -> windows_core::HRESULT;
+    if mon.0.is_null() {
+        return 96;
+    }
+
+    // One-time initialization of function pointer
+    if !DPI_FN_INIT.load(Ordering::Relaxed) {
         if let Ok(shcore) = LoadLibraryW(w!("shcore.dll")) {
             if let Some(proc) = GetProcAddress(shcore, PCSTR(b"GetDpiForMonitor\0".as_ptr())) {
-                let func: FnGetDpiForMonitor = mem::transmute(proc);
-                let mut dx = 0u32;
-                let mut dy = 0u32;
-                if func(mon, 0 /* MDT_EFFECTIVE_DPI */, &mut dx, &mut dy).is_ok() && dx > 0 {
-                    return dx;
-                }
+                DPI_FN.store(proc as *mut c_void, Ordering::Relaxed);
             }
+        }
+        DPI_FN_INIT.store(true, Ordering::Release);
+    }
+
+    let proc = DPI_FN.load(Ordering::Acquire);
+    if !proc.is_null() {
+        let func: FnGetDpiForMonitor = mem::transmute(proc);
+        let mut dx = 0u32;
+        let mut dy = 0u32;
+        if func(mon, 0 /* MDT_EFFECTIVE_DPI */, &mut dx, &mut dy).is_ok() && dx > 0 {
+            return dx;
         }
     }
     96
 }
 
-// ─── Image & Icon Loader (GDI+ embedded PNG decoder) ─────────────────────────
+// ─── Image & Icon Loader (Native User32 PNG decoder, zero GDI+ overhead) ───────
 
-unsafe fn create_app_icon() -> HICON {
-    let mut token = 0usize;
-    let input = GdiplusStartupInput {
-        GdiplusVersion: 1,
-        ..Default::default()
-    };
-    if GdiplusStartup(&mut token, &input, ptr::null_mut()).0 == 0 {
-        if let Some(stream) = SHCreateMemStream(Some(LOGO_PNG)) {
-            let mut bitmap = ptr::null_mut();
-            if GdipCreateBitmapFromStream(&stream, &mut bitmap).0 == 0 && !bitmap.is_null() {
-                let mut hicon = HICON::default();
-                if GdipCreateHICONFromBitmap(bitmap, &mut hicon).0 == 0 && !hicon.is_invalid() {
-                    let _ = GdipDisposeImage(bitmap as *mut _);
-                    return hicon;
-                }
-                let _ = GdipDisposeImage(bitmap as *mut _);
-            }
+/// Cached app icon — created once, reused for the lifetime of the process.
+static CACHED_ICON: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+unsafe fn get_app_icon() -> HICON {
+    let cached = CACHED_ICON.load(Ordering::Relaxed);
+    if !cached.is_null() {
+        return HICON(cached);
+    }
+    let icon = create_app_icon_inner();
+    CACHED_ICON.store(icon.0, Ordering::Relaxed);
+    icon
+}
+
+unsafe fn create_app_icon_inner() -> HICON {
+    // Windows Vista+ CreateIconFromResourceEx natively decodes raw PNG bytes
+    // in user32.dll without loading gdiplus.dll or shlwapi.dll.
+    if let Ok(hicon) = CreateIconFromResourceEx(
+        LOGO_PNG,
+        true,
+        0x0003_0000,
+        0,
+        0,
+        LR_DEFAULTCOLOR,
+    ) {
+        if !hicon.is_invalid() {
+            return hicon;
         }
     }
     LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
@@ -573,12 +687,39 @@ unsafe fn set_default_audio_device(endpoint_id: &str) -> bool {
     false
 }
 
-// ─── Device helpers ──────────────────────────────────────────────────────────
+// ─── Device helpers & UI-thread COM cache ────────────────────────────────────
 
-unsafe fn describe(d: &IMMDevice) -> Result<DeviceInfo> {
+thread_local! {
+    static UI_ENUMERATOR: RefCell<Option<IMMDeviceEnumerator>> = const { RefCell::new(None) };
+}
+
+unsafe fn with_ui_enumerator<R>(f: impl FnOnce(&IMMDeviceEnumerator) -> R) -> Option<R> {
+    UI_ENUMERATOR.with(|cell| {
+        if cell.borrow().is_none() {
+            if let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                *cell.borrow_mut() = Some(en);
+            }
+        }
+        cell.borrow().as_ref().map(f)
+    })
+}
+
+unsafe fn describe_id(d: &IMMDevice) -> Result<String> {
     let id_p = d.GetId()?;
     let id = id_p.to_string().unwrap_or_default();
     CoTaskMemFree(Some(id_p.0 as _));
+    Ok(id)
+}
+
+unsafe fn default_device_id(en: &IMMDeviceEnumerator) -> Option<String> {
+    en.GetDefaultAudioEndpoint(eRender, eMultimedia)
+        .or_else(|_| en.GetDefaultAudioEndpoint(eRender, eConsole))
+        .ok()
+        .and_then(|d| describe_id(&d).ok())
+}
+
+unsafe fn describe(d: &IMMDevice) -> Result<DeviceInfo> {
+    let id = describe_id(d)?;
     let store = d.OpenPropertyStore(STGM_READ)?;
     let pv = store.GetValue(&PKEY_Device_FriendlyName)?;
     let name_p = PropVariantToStringAlloc(&pv)?;
@@ -589,12 +730,14 @@ unsafe fn describe(d: &IMMDevice) -> Result<DeviceInfo> {
 
 unsafe fn enumerate_devices(en: &IMMDeviceEnumerator) -> Result<Vec<(IMMDevice, DeviceInfo)>> {
     let col = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-    let mut devs = Vec::new();
-    for i in 0..col.GetCount()? {
+    let count = col.GetCount()?;
+    let mut devs = Vec::with_capacity(count as usize);
+    for i in 0..count {
         let d = col.Item(i)?;
         let info = describe(&d)?;
         devs.push((d, info));
     }
+    devs.sort_by(|a, b| a.1.name.cmp(&b.1.name).then_with(|| a.1.id.cmp(&b.1.id)));
     Ok(devs)
 }
 
@@ -605,6 +748,17 @@ enum Found {
 }
 
 unsafe fn find(en: &IMMDeviceEnumerator, needle: &str) -> Result<Found> {
+    // O(1) direct endpoint lookup when full endpoint ID is known
+    if needle.starts_with('{') {
+        if let Ok(d) = en.GetDevice(&HSTRING::from(needle)) {
+            if let Ok(state) = d.GetState() {
+                if state == DEVICE_STATE_ACTIVE {
+                    return Ok(Found::One(d.clone(), describe(&d)?));
+                }
+            }
+        }
+    }
+
     let needle_lower = needle.to_lowercase();
     let col = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
     let mut hits = Vec::new();
@@ -628,6 +782,40 @@ unsafe fn find(en: &IMMDeviceEnumerator, needle: &str) -> Result<Found> {
         }
         n => Found::Many(n),
     })
+}
+
+/// Resolves both source and destination endpoints with O(1) ID lookup when possible,
+/// falling back to a single endpoint enumeration pass if partial names are used.
+unsafe fn find_pair(
+    en: &IMMDeviceEnumerator,
+    src_needle: &str,
+    dst_needle: &str,
+) -> Result<((IMMDevice, DeviceInfo), (IMMDevice, DeviceInfo))> {
+    let try_direct = |id: &str| -> Option<(IMMDevice, DeviceInfo)> {
+        if !id.starts_with('{') {
+            return None;
+        }
+        let d = en.GetDevice(&HSTRING::from(id)).ok()?;
+        if d.GetState().ok()? != DEVICE_STATE_ACTIVE {
+            return None;
+        }
+        let info = describe(&d).ok()?;
+        Some((d, info))
+    };
+
+    if let (Some(s), Some(t)) = (try_direct(src_needle), try_direct(dst_needle)) {
+        return Ok((s, t));
+    }
+
+    let s = match find(en, src_needle)? {
+        Found::One(d, info) => (d, info),
+        _ => return Err(Error::from(E_FAIL)),
+    };
+    let t = match find(en, dst_needle)? {
+        Found::One(d, info) => (d, info),
+        _ => return Err(Error::from(E_FAIL)),
+    };
+    Ok((s, t))
 }
 
 unsafe fn list_devices(en: &IMMDeviceEnumerator) -> Result<()> {
@@ -691,68 +879,101 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeCallback_Impl {
 
 // ─── WASAPI mirror session (Ultra-Low Latency Pipeline) ───────────────────────
 
+unsafe fn wait_while_paused(shared: &Shared) {
+    shared.set_status(STATUS_IDLE);
+    let wake_raw = shared.wake_event.load(Ordering::Relaxed);
+    if wake_raw != 0 {
+        let wake_handle = HANDLE(wake_raw as *mut _);
+        // Zero-CPU infinite wait: OnDefaultDeviceChanged / hotkey / menu immediately signals wake_event.
+        let _ = WaitForSingleObject(wake_handle, INFINITE);
+    } else {
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+unsafe fn formats_equal(a: *const WAVEFORMATEX, b: *const WAVEFORMATEX) -> bool {
+    let wa = ptr::read_unaligned(a);
+    let wb = ptr::read_unaligned(b);
+    let len_a = mem::size_of::<WAVEFORMATEX>() + wa.cbSize as usize;
+    let len_b = mem::size_of::<WAVEFORMATEX>() + wb.cbSize as usize;
+    len_a == len_b
+        && std::slice::from_raw_parts(a as *const u8, len_a)
+            == std::slice::from_raw_parts(b as *const u8, len_b)
+}
+
 unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> {
-    if shared.paused.load(Ordering::Relaxed) {
-        shared.set_status(STATUS_IDLE);
-        let wake_raw = shared.wake_event.load(Ordering::Relaxed);
-        if wake_raw != 0 {
-            let wake_handle = HANDLE(wake_raw as *mut _);
-            let _ = WaitForSingleObject(wake_handle, 2000);
-        } else {
-            thread::sleep(Duration::from_millis(500));
-        }
+    if shared.paused.load(Ordering::Relaxed) || shared.manual_paused.load(Ordering::Relaxed) {
+        wait_while_paused(shared);
         return Ok(());
     }
 
-    let src_needle = shared.src.lock().unwrap().clone();
-    let dst_needle = shared.dst.lock().unwrap().clone();
+    let (src_needle, dst_needle) = {
+        let s = shared.src.lock().unwrap().clone();
+        let d = shared.dst.lock().unwrap().clone();
+        (s, d)
+    };
     let cushion_ms = shared.cushion_ms.load(Ordering::Relaxed);
 
     if src_needle.is_empty() || dst_needle.is_empty() {
         return Err(Error::from(E_FAIL));
     }
 
-    // Verify current Windows default output matches the mirror source.
-    // If not (e.g. headset active), keep monitors silent and pause.
-    if let Ok(def) = en.GetDefaultAudioEndpoint(eRender, eMultimedia) {
-        if let Ok(def_info) = describe(&def) {
-            if !is_match(&def_info, &src_needle) {
+    // Fast pre-check before touching devices when full ID is configured
+    let def_id = default_device_id(en);
+    if src_needle.starts_with('{') {
+        if let Some(ref cur_def) = def_id {
+            if !cur_def.eq_ignore_ascii_case(&src_needle) {
                 shared.paused.store(true, Ordering::Relaxed);
-                shared.set_status(STATUS_IDLE);
-                let wake_raw = shared.wake_event.load(Ordering::Relaxed);
-                if wake_raw != 0 {
-                    let wake_handle = HANDLE(wake_raw as *mut _);
-                    let _ = WaitForSingleObject(wake_handle, 2000);
-                } else {
-                    thread::sleep(Duration::from_millis(500));
-                }
+                wait_while_paused(shared);
                 return Ok(());
             }
         }
     }
 
-    let (src, src_info) = match find(en, &src_needle)? {
-        Found::One(d, info) => (d, info),
-        _ => return Err(Error::from(E_FAIL)),
-    };
-    let (dst, dst_info) = match find(en, &dst_needle)? {
-        Found::One(d, info) => (d, info),
-        _ => return Err(Error::from(E_FAIL)),
-    };
+    let ((src, src_info), (dst, dst_info)) = find_pair(en, &src_needle, &dst_needle)?;
     if src_info.id == dst_info.id {
         return Err(Error::from(E_FAIL));
     }
 
+    // Verify default output matches resolved source (handles CLI partial names too)
+    if let Some(ref cur_def) = def_id {
+        if !cur_def.eq_ignore_ascii_case(&src_info.id) {
+            *shared.resolved_src_id.lock().unwrap() = src_info.id;
+            shared.paused.store(true, Ordering::Relaxed);
+            wait_while_paused(shared);
+            return Ok(());
+        }
+    }
+
+    *shared.resolved_src_id.lock().unwrap() = src_info.id.clone();
     *shared.src_name.lock().unwrap() = src_info.name.clone();
     *shared.dst_name.lock().unwrap() = dst_info.name.clone();
 
     // ── Open audio clients ──────────────────────────────────────────
     let sc: IAudioClient = src.Activate(CLSCTX_ALL, None)?;
-    let dc: IAudioClient = dst.Activate(CLSCTX_ALL, None)?;
+    let mut dc: IAudioClient = dst.Activate(CLSCTX_ALL, None)?;
 
     let fmt = sc.GetMixFormat()?;
     let wf = ptr::read_unaligned(fmt);
     let (rate, frame_bytes) = (wf.nSamplesPerSec, wf.nBlockAlign as usize);
+
+    // Query device period BEFORE Initialize so destination buffer is sized tightly to period + cushion
+    let (mut period_hns, mut min_hns) = (100_000i64, 0i64);
+    let _ = sc.GetDevicePeriod(Some(&mut period_hns), Some(&mut min_hns));
+    if period_hns <= 0 {
+        period_hns = 100_000;
+    }
+
+    // Skip Windows' Audio Resampler MFT when source and destination mix formats match identically
+    let mut dst_flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    if let Ok(dfmt) = dc.GetMixFormat() {
+        if formats_equal(fmt, dfmt) {
+            dst_flags = 0;
+        }
+        CoTaskMemFree(Some(dfmt as _));
+    }
+
+    let req_hns = (period_hns + (cushion_ms as i64 + 2) * 10_000).max(130_000);
 
     let ev = CreateEventW(None, false, false, PCWSTR::null())?;
     let init = (|| -> Result<()> {
@@ -765,14 +986,23 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
             None,
         )?;
         sc.SetEventHandle(ev)?;
-        dc.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-            150_000, // 15 ms ring buffer (ultra-tight queue, minimal latency)
-            0,
-            fmt,
-            None,
-        )
+        if dc
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, dst_flags, req_hns, 0, fmt, None)
+            .is_err()
+            && dst_flags == 0
+        {
+            // Fallback with AUTOCONVERTPCM on a freshly activated client if direct match is rejected
+            dc = dst.Activate(CLSCTX_ALL, None)?;
+            dc.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                req_hns,
+                0,
+                fmt,
+                None,
+            )?;
+        }
+        Ok(())
     })();
     CoTaskMemFree(Some(fmt as _));
     if let Err(e) = init {
@@ -818,7 +1048,11 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
     shared.set_status(STATUS_ACTIVE);
 
     if !shared.notified.swap(true, Ordering::Relaxed) {
-        show_balloon(shared, "Mirror Active", &format!("{} → {}", trunc(&src_info.name, 40), trunc(&dst_info.name, 40)));
+        show_balloon(
+            shared,
+            "Mirror Active",
+            &format!("{} → {} ({} ms)", trunc(&src_info.name, 36), trunc(&dst_info.name, 36), cushion_ms),
+        );
     }
 
     let result = (|| -> Result<()> {
@@ -826,10 +1060,8 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
         let rnd: IAudioRenderClient = dc.GetService()?;
         let ring = dc.GetBufferSize()?;
 
-        let (mut period_hns, mut min_hns) = (0i64, 0i64);
-        sc.GetDevicePeriod(Some(&mut period_hns), Some(&mut min_hns))?;
         let period = ((rate as i64 * period_hns / 10_000_000) as u32).max(1);
-        let cushion = (rate / 1000 * cushion_ms).max(1);
+        let cushion = ((rate as u64 * cushion_ms as u64 / 1000) as u32).max(1);
         let high = (cushion + period).min(ring);
 
         let wake_raw = shared.wake_event.load(Ordering::Relaxed);
@@ -840,9 +1072,13 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
         sc.Start()?;
 
         loop {
-            let w = WaitForMultipleObjects(&wait_handles, false, 250);
+            // 1000 ms timeout cuts dormant idle wakeups by 4x-10x; IMMNotificationClient + wake_event still react in 0 ms
+            let w = WaitForMultipleObjects(&wait_handles, false, 1000);
 
-            if shared.restart.load(Ordering::Relaxed) || shared.quit.load(Ordering::Relaxed) {
+            if w == windows::Win32::Foundation::WAIT_EVENT(WAIT_OBJECT_0.0 + 1)
+                || shared.restart.load(Ordering::Relaxed)
+                || shared.quit.load(Ordering::Relaxed)
+            {
                 break;
             }
 
@@ -856,20 +1092,26 @@ unsafe fn session(en: &IMMDeviceEnumerator, shared: &Arc<Shared>) -> Result<()> 
 
                 let queued = dc.GetCurrentPadding()?;
                 let prime = if queued == 0 { cushion } else { 0 };
-                let n = frames.min(high.saturating_sub(queued + prime));
+                let silent = (flags & BUFFERFLAGS_SILENT) != 0;
+                let mut n = frames.min(high.saturating_sub(queued + prime));
+                if silent && queued > cushion {
+                    // Snap any accumulated latency drift cleanly back to target cushion during silence
+                    n = n.min((cushion + frames).saturating_sub(queued + prime));
+                }
                 let total = prime + n;
                 if total > 0 {
                     let out = rnd.GetBuffer(total)?;
-                    if prime > 0 {
-                        ptr::write_bytes(out, 0, prime as usize * frame_bytes);
-                    }
-                    let body = out.add(prime as usize * frame_bytes);
-                    if flags & BUFFERFLAGS_SILENT != 0 {
-                        ptr::write_bytes(body, 0, n as usize * frame_bytes);
+                    if silent {
+                        // Zero-copy WASAPI silence flag skips memset of silent audio buffers
+                        rnd.ReleaseBuffer(total, BUFFERFLAGS_SILENT)?;
                     } else {
+                        if prime > 0 {
+                            ptr::write_bytes(out, 0, prime as usize * frame_bytes);
+                        }
+                        let body = out.add(prime as usize * frame_bytes);
                         ptr::copy_nonoverlapping(data, body, n as usize * frame_bytes);
+                        rnd.ReleaseBuffer(total, 0)?;
                     }
-                    rnd.ReleaseBuffer(total, 0)?;
                 }
                 cap.ReleaseBuffer(frames)?;
             }
@@ -966,37 +1208,33 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
     }
     let shared = &*p;
 
-    let en: IMMDeviceEnumerator = match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Some((devices, current_default_id)) = with_ui_enumerator(|en| {
+        let devs = enumerate_devices(en).ok()?;
+        if devs.is_empty() {
+            return None;
+        }
+        let def = default_device_id(en).unwrap_or_else(|| shared.src.lock().unwrap().clone());
+        Some((devs, def))
+    })
+    .flatten() else {
+        return;
     };
-    let devices = match enumerate_devices(&en) {
-        Ok(d) if !d.is_empty() => d,
-        _ => return,
-    };
-
-    let favorites = shared.favorites.lock().unwrap().clone();
 
     // Determine candidate list: if at least 2 favorites exist, cycle ONLY among favorites; else all devices.
-    let fav_candidates: Vec<&(IMMDevice, DeviceInfo)> =
-        devices.iter().filter(|d| favorites.contains(&d.1.id)).collect();
-    let candidates: Vec<&(IMMDevice, DeviceInfo)> = if fav_candidates.len() > 1 {
-        fav_candidates
-    } else {
-        devices.iter().collect()
+    let candidates: Vec<&(IMMDevice, DeviceInfo)> = {
+        let favorites = shared.favorites.lock().unwrap();
+        let fav_candidates: Vec<&(IMMDevice, DeviceInfo)> =
+            devices.iter().filter(|d| favorites.contains(&d.1.id)).collect();
+        if fav_candidates.len() > 1 {
+            fav_candidates
+        } else {
+            devices.iter().collect()
+        }
     };
 
     if candidates.len() <= 1 {
         return;
     }
-
-    let current_default_id = en
-        .GetDefaultAudioEndpoint(eRender, eMultimedia)
-        .or_else(|_| en.GetDefaultAudioEndpoint(eRender, eConsole))
-        .ok()
-        .and_then(|d| describe(&d).ok())
-        .map(|info| info.id)
-        .unwrap_or_else(|| shared.src.lock().unwrap().clone());
 
     let next_idx = match candidates.iter().position(|d| d.1.id == current_default_id) {
         Some(pos) => (pos + 1) % candidates.len(),
@@ -1007,20 +1245,30 @@ unsafe fn cycle_audio_device(hwnd: HWND) {
     let switched = set_default_audio_device(&next_device.1.id);
 
     // Check if the newly selected default output device is our configured mirror source
-    let src_id = shared.src.lock().unwrap().clone();
-    let is_mirror_src = !src_id.is_empty() && next_device.1.id == src_id;
+    let is_mirror_src = {
+        let resolved = shared.resolved_src_id.lock().unwrap();
+        let target = if !resolved.is_empty() {
+            &*resolved
+        } else {
+            &*shared.src.lock().unwrap()
+        };
+        !target.is_empty() && next_device.1.id.eq_ignore_ascii_case(target)
+    };
 
     // Do NOT touch shared.src or shared.dst!
-    // If switched to the mirror source monitor, mirror is ACTIVE.
+    // If switched to the mirror source monitor (and not manually paused), mirror is ACTIVE.
     // If switched to headset or other device, mirror is PAUSED so monitors stay silent!
-    shared.paused.store(!is_mirror_src, Ordering::Relaxed);
+    let new_paused = !is_mirror_src || shared.manual_paused.load(Ordering::Relaxed);
+    shared.paused.store(new_paused, Ordering::Relaxed);
     shared.restart.store(true, Ordering::Relaxed);
     shared.signal_wake();
 
     update_tooltip(hwnd, shared);
     if switched {
-        let balloon_msg = if is_mirror_src {
+        let balloon_msg = if is_mirror_src && !shared.manual_paused.load(Ordering::Relaxed) {
             format!("Default: {}\n(Mirror Active)", next_device.1.name)
+        } else if is_mirror_src {
+            format!("Default: {}\n(Manually Paused)", next_device.1.name)
         } else {
             format!("Default: {}\n(Monitors Silent)", next_device.1.name)
         };
@@ -1241,6 +1489,7 @@ unsafe impl Send for ActiveMenuContext {}
 unsafe impl Sync for ActiveMenuContext {}
 
 static ACTIVE_MENU_CTX: Mutex<Option<ActiveMenuContext>> = Mutex::new(None);
+static LAST_MENU_DEVICES: Mutex<Vec<DeviceInfo>> = Mutex::new(Vec::new());
 
 /// Global Windows message hook that intercepts clicks inside the Favorites submenu
 /// and toggles favorites in place without closing the right-click menu!
@@ -1284,14 +1533,14 @@ unsafe extern "system" fn menu_msg_filter_hook(ncode: i32, wparam: WPARAM, lpara
                                     for it in items.iter_mut() {
                                         if it.id == IDM_FAV_BASE + uidx as u16 {
                                             it.checked = !was_fav;
-                                            it.shortcut = if !was_fav { "★" } else { "" }.to_string();
+                                            it.set_shortcut(if !was_fav { "★" } else { "" });
                                         } else if it.kind == MenuItemKind::FavoritesHeader {
                                             it.checked = has_favs;
-                                            it.text = if !has_favs {
+                                            it.set_text(if !has_favs {
                                                 "★ Favorites (None set)"
                                             } else {
                                                 "★ Favorites"
-                                            }.to_string();
+                                            });
                                         }
                                     }
                                 }
@@ -1306,10 +1555,10 @@ unsafe extern "system" fn menu_msg_filter_hook(ncode: i32, wparam: WPARAM, lpara
                                     for it in items.iter_mut() {
                                         if it.kind == MenuItemKind::ItemFavorite {
                                             it.checked = false;
-                                            it.shortcut = String::new();
+                                            it.set_shortcut("");
                                         } else if it.kind == MenuItemKind::FavoritesHeader {
                                             it.checked = false;
-                                            it.text = "★ Favorites (None set)".to_string();
+                                            it.set_text("★ Favorites (None set)");
                                         }
                                     }
                                 }
@@ -1340,6 +1589,9 @@ unsafe extern "system" fn menu_msg_filter_hook(ncode: i32, wparam: WPARAM, lpara
 // ─── Tray Icon & Color-Coded Right-Click Menu ────────────────────────────────
 
 static GLOBAL_SHARED: AtomicPtr<Shared> = AtomicPtr::new(ptr::null_mut());
+static FONT_NORMAL: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static FONT_BOLD: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static FONT_CACHED_DPI: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -1347,6 +1599,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             let event = lp.0 as u32 & 0xFFFF;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
                 show_context_menu(hwnd);
+            } else if event == WM_MBUTTONUP {
+                cycle_audio_device(hwnd);
             }
             LRESULT(0)
         }
@@ -1397,12 +1651,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     }
                     MenuItemKind::HeaderSource | MenuItemKind::HeaderDest | MenuItemKind::FavoritesHeader => {
                         mis.itemHeight = (26.0 * scale).round() as u32;
-                        mis.itemWidth = (300.0 * scale).round() as u32;
+                        let text_w = (item.text_len * 8 + item.shortcut_len * 8 + 72) as f32 * scale;
+                        mis.itemWidth = text_w.max(330.0 * scale).round() as u32;
                     }
                     _ => {
                         mis.itemHeight = (28.0 * scale).round() as u32;
-                        let text_w = (item.text.chars().count() * 8 + item.shortcut.chars().count() * 8 + 80) as f32 * scale;
-                        mis.itemWidth = text_w.max(320.0 * scale).round() as u32;
+                        let text_w = (item.text_len * 8 + item.shortcut_len * 8 + 84) as f32 * scale;
+                        mis.itemWidth = text_w.max(330.0 * scale).round() as u32;
                     }
                 }
             }
@@ -1424,6 +1679,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_DESTROY => {
+            let old_n = FONT_NORMAL.swap(ptr::null_mut(), Ordering::Relaxed);
+            let old_b = FONT_BOLD.swap(ptr::null_mut(), Ordering::Relaxed);
+            if !old_n.is_null() {
+                let _ = DeleteObject(HGDIOBJ(old_n));
+            }
+            if !old_b.is_null() {
+                let _ = DeleteObject(HGDIOBJ(old_b));
+            }
+            let old_icon = CACHED_ICON.swap(ptr::null_mut(), Ordering::Relaxed);
+            if !old_icon.is_null() {
+                let _ = DestroyIcon(HICON(old_icon));
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -1431,29 +1698,50 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+#[inline]
+unsafe fn fill_solid(hdc: HDC, rc: &RECT, color: COLORREF) {
+    SetDCBrushColor(hdc, color);
+    let dc_brush = HBRUSH(GetStockObject(DC_BRUSH).0);
+    FillRect(hdc, rc, dc_brush);
+}
+
+#[inline]
+unsafe fn draw_u16_slice(
+    hdc: HDC,
+    src: &[u16],
+    rect: &mut RECT,
+    flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
+    let mut stack_buf = [0u16; 256];
+    let n = src.len().min(stack_buf.len());
+    stack_buf[..n].copy_from_slice(&src[..n]);
+    DrawTextW(hdc, &mut stack_buf[..n], rect, flags);
+}
+
 unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWND) {
     let hdc = dis.hDC;
     let rc = dis.rcItem;
     let selected = (dis.itemState & ODS_SELECTED) != 0;
-    let disabled = (dis.itemState & ODS_GRAYED) != 0 || (dis.itemState & ODS_DISABLED) != 0;
+    let disabled = item.disabled || (dis.itemState & ODS_GRAYED) != 0 || (dis.itemState & ODS_DISABLED) != 0;
 
     let dpi = ACTIVE_MENU_DPI.load(Ordering::Relaxed);
     let dpi = if dpi == 0 { 96 } else { dpi };
     let scale = dpi as f32 / 96.0;
 
-    let bg_color = match item.kind {
-        MenuItemKind::ItemSource if selected => CLR_BG_SRC_HOVER,
-        MenuItemKind::ItemDest if selected => CLR_BG_DST_HOVER,
-        _ if selected => CLR_BG_HOVER,
-        _ => CLR_BG,
+    let bg_color = if item.disabled {
+        CLR_BG
+    } else {
+        match item.kind {
+            MenuItemKind::ItemSource if selected => CLR_BG_SRC_HOVER,
+            MenuItemKind::ItemDest if selected => CLR_BG_DST_HOVER,
+            _ if selected => CLR_BG_HOVER,
+            _ => CLR_BG,
+        }
     };
 
-    let bg_brush = CreateSolidBrush(bg_color);
-    FillRect(hdc, &rc, bg_brush);
-    let _ = DeleteObject(bg_brush.into());
+    fill_solid(hdc, &rc, bg_color);
 
     if item.kind == MenuItemKind::Separator {
-        let sep_brush = CreateSolidBrush(CLR_SEPARATOR);
         let pad_h = (12.0 * scale) as i32;
         let sep_rect = RECT {
             left: rc.left + pad_h,
@@ -1461,14 +1749,14 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
             right: rc.right - pad_h,
             bottom: rc.top + (5.0 * scale).max(rc.top as f32 + 1.0) as i32,
         };
-        FillRect(hdc, &sep_rect, sep_brush);
-        let _ = DeleteObject(sep_brush.into());
+        fill_solid(hdc, &sep_rect, CLR_SEPARATOR);
         return;
     }
 
     SetBkMode(hdc, TRANSPARENT);
 
-    // Font selection: crisp native point size proportional to physical monitor DPI
+    // Font selection: crisp native point size proportional to physical monitor DPI.
+    // Fonts are cached per (DPI, weight) to avoid CreateFontW/DeleteObject per menu item.
     let font_weight = match item.kind {
         MenuItemKind::HeaderSource | MenuItemKind::HeaderDest | MenuItemKind::FavoritesHeader => FW_BOLD,
         MenuItemKind::ItemSource | MenuItemKind::ItemDest if item.checked => FW_BOLD,
@@ -1476,59 +1764,57 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
         _ => FW_NORMAL,
     };
 
-    // 10pt Segoe UI scaled to exact monitor DPI for pin-sharp ClearType anti-aliasing
-    let font_height = -((10 * dpi as i32 + 36) / 72);
-    let font = CreateFontW(
-        font_height,
-        0, 0, 0,
-        font_weight.0 as i32,
-        0, 0, 0,
-        FONT_CHARSET(1), // DEFAULT_CHARSET for full Unicode and symbol support
-        FONT_OUTPUT_PRECISION(0),
-        FONT_CLIP_PRECISION(0),
-        FONT_QUALITY(5), // CLEARTYPE_QUALITY
-        0,
-        w!("Segoe UI"),
-    );
+    let cached_dpi = FONT_CACHED_DPI.load(Ordering::Relaxed);
+    if cached_dpi != dpi {
+        let old_n = FONT_NORMAL.swap(ptr::null_mut(), Ordering::Relaxed);
+        let old_b = FONT_BOLD.swap(ptr::null_mut(), Ordering::Relaxed);
+        if !old_n.is_null() {
+            let _ = DeleteObject(HGDIOBJ(old_n));
+        }
+        if !old_b.is_null() {
+            let _ = DeleteObject(HGDIOBJ(old_b));
+        }
+        FONT_CACHED_DPI.store(dpi, Ordering::Relaxed);
+    }
+
+    let font_slot = if font_weight == FW_BOLD { &FONT_BOLD } else { &FONT_NORMAL };
+    let mut font_ptr = font_slot.load(Ordering::Relaxed);
+    if font_ptr.is_null() {
+        let font_height = -((10 * dpi as i32 + 36) / 72);
+        let new_font = CreateFontW(
+            font_height,
+            0, 0, 0,
+            font_weight.0 as i32,
+            0, 0, 0,
+            FONT_CHARSET(1), // DEFAULT_CHARSET
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
+            FONT_QUALITY(5), // CLEARTYPE_QUALITY
+            0,
+            w!("Segoe UI"),
+        );
+        font_ptr = new_font.0;
+        font_slot.store(font_ptr, Ordering::Relaxed);
+    }
+    let font = HFONT(font_ptr);
     let old_font = SelectObject(hdc, font.into());
 
-    // Left accent pill or indicator
+    // Left accent pill
     let pill_w = (4.0 * scale).max(3.0) as i32;
-    match item.kind {
-        MenuItemKind::HeaderSource => {
-            let pill_brush = CreateSolidBrush(CLR_BLUE_ACCENT);
-            let pill_rect = RECT {
-                left: rc.left + (5.0 * scale) as i32,
-                top: rc.top + (5.0 * scale) as i32,
-                right: rc.left + (5.0 * scale) as i32 + pill_w,
-                bottom: rc.bottom - (5.0 * scale) as i32,
-            };
-            FillRect(hdc, &pill_rect, pill_brush);
-            let _ = DeleteObject(pill_brush.into());
-        }
-        MenuItemKind::HeaderDest => {
-            let pill_brush = CreateSolidBrush(CLR_RED_ACCENT);
-            let pill_rect = RECT {
-                left: rc.left + (5.0 * scale) as i32,
-                top: rc.top + (5.0 * scale) as i32,
-                right: rc.left + (5.0 * scale) as i32 + pill_w,
-                bottom: rc.bottom - (5.0 * scale) as i32,
-            };
-            FillRect(hdc, &pill_rect, pill_brush);
-            let _ = DeleteObject(pill_brush.into());
-        }
-        MenuItemKind::SoundSwitch => {
-            let pill_brush = CreateSolidBrush(CLR_CYAN_ACCENT);
-            let pill_rect = RECT {
-                left: rc.left + (5.0 * scale) as i32,
-                top: rc.top + (5.0 * scale) as i32,
-                right: rc.left + (5.0 * scale) as i32 + pill_w,
-                bottom: rc.bottom - (5.0 * scale) as i32,
-            };
-            FillRect(hdc, &pill_rect, pill_brush);
-            let _ = DeleteObject(pill_brush.into());
-        }
-        _ => {}
+    let pill_color = match item.kind {
+        MenuItemKind::HeaderSource => Some(CLR_BLUE_ACCENT),
+        MenuItemKind::HeaderDest => Some(CLR_RED_ACCENT),
+        MenuItemKind::SoundSwitch => Some(CLR_CYAN_ACCENT),
+        _ => None,
+    };
+    if let Some(pclr) = pill_color {
+        let pill_rect = RECT {
+            left: rc.left + (5.0 * scale) as i32,
+            top: rc.top + (5.0 * scale) as i32,
+            right: rc.left + (5.0 * scale) as i32 + pill_w,
+            bottom: rc.bottom - (5.0 * scale) as i32,
+        };
+        fill_solid(hdc, &pill_rect, pclr);
     }
 
     // Checkmark or star glyph drawing
@@ -1537,12 +1823,13 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
             MenuItemKind::ItemSource => CLR_BLUE_ACCENT,
             MenuItemKind::ItemDest => CLR_RED_ACCENT,
             MenuItemKind::ItemFavorite => CLR_GOLD_ACCENT,
-            MenuItemKind::VolumeSync => CLR_SILVER_ACCENT,
+            MenuItemKind::VolumeSync | MenuItemKind::CushionOption => CLR_SILVER_ACCENT,
+            MenuItemKind::PauseMirror => CLR_GOLD_ACCENT,
             _ => CLR_TEXT,
         };
         SetTextColor(hdc, check_color);
         let mut check_glyph = if item.kind == MenuItemKind::ItemFavorite {
-            [0x2605u16] // ★ (Single glyph slice: no trailing null character)
+            [0x2605u16] // ★
         } else {
             [0x2713u16] // ✓
         };
@@ -1556,48 +1843,67 @@ unsafe fn draw_menu_item(dis: &DRAWITEMSTRUCT, item: &CustomMenuItem, _hwnd: HWN
     }
 
     // Text color
-    let text_color = if disabled {
-        CLR_TEXT_MUTED
-    } else {
-        match item.kind {
-            MenuItemKind::HeaderSource => CLR_BLUE_ACCENT,
-            MenuItemKind::HeaderDest => CLR_RED_ACCENT,
-            MenuItemKind::SoundSwitch => CLR_CYAN_ACCENT,
-            MenuItemKind::FavoritesHeader | MenuItemKind::ItemFavorite => CLR_GOLD_ACCENT,
-            MenuItemKind::VolumeSync => CLR_SILVER_ACCENT,
-            MenuItemKind::Exit => CLR_EXIT_ACCENT,
-            MenuItemKind::ItemSource if item.checked => CLR_TEXT,
-            MenuItemKind::ItemDest if item.checked => CLR_TEXT,
-            _ => CLR_TEXT,
-        }
+    let text_color = match item.kind {
+        MenuItemKind::HeaderSource => CLR_BLUE_ACCENT,
+        MenuItemKind::HeaderDest => CLR_RED_ACCENT,
+        MenuItemKind::SoundSwitch => CLR_CYAN_ACCENT,
+        MenuItemKind::FavoritesHeader | MenuItemKind::ItemFavorite => CLR_GOLD_ACCENT,
+        MenuItemKind::VolumeSync => CLR_SILVER_ACCENT,
+        MenuItemKind::PauseMirror if item.checked => CLR_GOLD_ACCENT,
+        MenuItemKind::Exit => CLR_EXIT_ACCENT,
+        _ if disabled => CLR_TEXT_MUTED,
+        _ => CLR_TEXT,
     };
     SetTextColor(hdc, text_color);
 
-    // Main text (exact length slice: zero blur or trailing null glyph artifact)
+    // Reserve clean right margin for shortcut/status badges so text never overlaps
+    let right_reserve = if item.shortcut_u16.is_empty() {
+        16.0
+    } else {
+        (item.shortcut_len as f32 * 7.5 + 26.0).max(84.0)
+    };
     let mut text_rect = RECT {
         left: rc.left + (30.0 * scale) as i32,
         top: rc.top,
-        right: rc.right - (60.0 * scale) as i32,
+        right: (rc.right - (right_reserve * scale) as i32).max(rc.left + 60),
         bottom: rc.bottom,
     };
-    let mut wide_text: Vec<u16> = item.text.encode_utf16().collect();
-    DrawTextW(hdc, &mut wide_text, &mut text_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    draw_u16_slice(
+        hdc,
+        &item.text_u16,
+        &mut text_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
 
-    // Shortcut label (right aligned)
-    if !item.shortcut.is_empty() {
-        SetTextColor(hdc, CLR_TEXT_MUTED);
+    // Shortcut or status badge (right aligned)
+    if !item.shortcut_u16.is_empty() {
+        let sc_color = if item.kind == MenuItemKind::HeaderSource {
+            if item.shortcut_u16.first().copied() == Some('●' as u16) {
+                CLR_GREEN_ACCENT
+            } else {
+                CLR_GOLD_ACCENT
+            }
+        } else if matches!(item.kind, MenuItemKind::ItemSource | MenuItemKind::ItemDest) {
+            CLR_CYAN_ACCENT
+        } else {
+            CLR_TEXT_MUTED
+        };
+        SetTextColor(hdc, sc_color);
         let mut sc_rect = RECT {
-            left: rc.right - (120.0 * scale) as i32,
+            left: rc.right - (150.0 * scale) as i32,
             top: rc.top,
             right: rc.right - (16.0 * scale) as i32,
             bottom: rc.bottom,
         };
-        let mut wide_sc: Vec<u16> = item.shortcut.encode_utf16().collect();
-        DrawTextW(hdc, &mut wide_sc, &mut sc_rect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        draw_u16_slice(
+            hdc,
+            &item.shortcut_u16,
+            &mut sc_rect,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 
     SelectObject(hdc, old_font);
-    let _ = DeleteObject(font.into());
 }
 
 fn get_hotkey_description(mod_code: u32, vk: u32) -> String {
@@ -1634,13 +1940,7 @@ unsafe fn push_custom_item(
     text: &str,
     shortcut: &str,
 ) {
-    let boxed = Box::new(CustomMenuItem {
-        id,
-        kind,
-        checked,
-        text: text.to_string(),
-        shortcut: shortcut.to_string(),
-    });
+    let boxed = Box::new(CustomMenuItem::new(id, kind, checked, text, shortcut));
     let raw_ptr = boxed.as_ref() as *const CustomMenuItem as usize;
     items.push(boxed);
     let flags = MF_OWNERDRAW
@@ -1660,13 +1960,7 @@ unsafe fn push_custom_popup(
     checked: bool,
     text: &str,
 ) {
-    let boxed = Box::new(CustomMenuItem {
-        id: 0,
-        kind,
-        checked,
-        text: text.to_string(),
-        shortcut: "▶".to_string(),
-    });
+    let boxed = Box::new(CustomMenuItem::new(0, kind, checked, text, "▶"));
     let raw_ptr = boxed.as_ref() as *const CustomMenuItem as usize;
     items.push(boxed);
     let _ = AppendMenuW(
@@ -1693,22 +1987,44 @@ unsafe fn show_context_menu(hwnd: HWND) {
         Err(_) => return,
     };
 
-    let en: std::result::Result<IMMDeviceEnumerator, _> =
-        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL);
-    let devices = en
-        .as_ref()
-        .ok()
-        .and_then(|e| enumerate_devices(e).ok())
-        .unwrap_or_default();
+    let (devices, default_id) = with_ui_enumerator(|en| {
+        let devs = enumerate_devices(en).unwrap_or_default();
+        let def = default_device_id(en).unwrap_or_default();
+        (devs, def)
+    })
+    .unwrap_or_default();
+
+    let dev_infos: Vec<DeviceInfo> = devices.iter().map(|d| d.1.clone()).collect();
+    *LAST_MENU_DEVICES.lock().unwrap() = dev_infos.clone();
 
     let mut items: Vec<Box<CustomMenuItem>> = Vec::new();
+    let cushion_ms = shared.cushion_ms.load(Ordering::Relaxed);
+    let is_manual_paused = shared.manual_paused.load(Ordering::Relaxed);
+    let is_paused = shared.paused.load(Ordering::Relaxed);
+
+    let status_badge = if is_manual_paused {
+        "⏸ PAUSED (MANUAL)".to_string()
+    } else if is_paused {
+        "⏸ PAUSED".to_string()
+    } else {
+        match shared.status.load(Ordering::Relaxed) {
+            STATUS_ACTIVE => format!("● ACTIVE  {} ms", cushion_ms),
+            STATUS_WAITING => "⏳ WAITING".to_string(),
+            _ => format!("{} ms", cushion_ms),
+        }
+    };
 
     // ── 1. SOURCE SECTION (BLUE) ──────────────────────────────────────────
-    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, "SOURCE (Capture Output)", "");
+    push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderSource, false, "SOURCE (Capture Output)", &status_badge);
     let current_src = shared.src.lock().unwrap().clone();
-    for (i, (_dev, info)) in devices.iter().enumerate() {
+    for (i, info) in dev_infos.iter().enumerate() {
         let is_chk = is_match(info, &current_src);
-        push_custom_item(&mut items, menu, IDM_SRC_BASE + i as u16, MenuItemKind::ItemSource, is_chk, &info.name, "");
+        let badge = if !default_id.is_empty() && info.id.eq_ignore_ascii_case(&default_id) {
+            "Default"
+        } else {
+            ""
+        };
+        push_custom_item(&mut items, menu, IDM_SRC_BASE + i as u16, MenuItemKind::ItemSource, is_chk, &info.name, badge);
     }
 
     push_custom_item(&mut items, menu, 0, MenuItemKind::Separator, false, "", "");
@@ -1716,7 +2032,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 2. DESTINATION SECTION (RED) ──────────────────────────────────────
     push_custom_item(&mut items, menu, 0, MenuItemKind::HeaderDest, false, "DESTINATION (Mirror Target)", "");
     let current_dst = shared.dst.lock().unwrap().clone();
-    for (i, (_dev, info)) in devices.iter().enumerate() {
+    for (i, info) in dev_infos.iter().enumerate() {
         let is_chk = is_match(info, &current_dst);
         push_custom_item(&mut items, menu, IDM_DST_BASE + i as u16, MenuItemKind::ItemDest, is_chk, &info.name, "");
     }
@@ -1741,9 +2057,8 @@ unsafe fn show_context_menu(hwnd: HWND) {
     // ── 4. FAVORITES SUBMENU (GOLD) ───────────────────────────────────────
     let fav_menu = CreatePopupMenu().unwrap_or_default();
     let favorites = shared.favorites.lock().unwrap().clone();
-    let dev_infos: Vec<DeviceInfo> = devices.iter().map(|d| d.1.clone()).collect();
 
-    for (i, (_dev, info)) in devices.iter().enumerate() {
+    for (i, info) in dev_infos.iter().enumerate() {
         let is_fav = favorites.contains(&info.id);
         push_custom_item(
             &mut items,
@@ -1790,13 +2105,22 @@ unsafe fn show_context_menu(hwnd: HWND) {
 
     push_custom_popup(&mut items, menu, hk_menu, MenuItemKind::SoundSwitch, false, "Switch Hotkey");
 
+    // ── 6. LATENCY CUSHION SUBMENU ────────────────────────────────────────
+    let cushion_menu = CreatePopupMenu().unwrap_or_default();
+    for &(id, ms, label) in CUSHION_PRESETS {
+        push_custom_item(&mut items, cushion_menu, id, MenuItemKind::CushionOption, cushion_ms == ms, label, "");
+    }
+    let cushion_label = format!("Latency Cushion ({} ms)", cushion_ms);
+    push_custom_popup(&mut items, menu, cushion_menu, MenuItemKind::VolumeSync, false, &cushion_label);
+
     push_custom_item(&mut items, menu, 0, MenuItemKind::Separator, false, "", "");
 
-    // ── 6. VOLUME SYNC (METALLIC SILVER) ──────────────────────────────────
+    // ── 7. PAUSE / VOLUME SYNC / AUTOSTART ────────────────────────────────
+    push_custom_item(&mut items, menu, IDM_PAUSE_MIRROR, MenuItemKind::PauseMirror, is_manual_paused, "Pause Mirroring", "");
+
     let vol_flag = shared.vol_sync.load(Ordering::Relaxed);
     push_custom_item(&mut items, menu, IDM_VOLSYNC, MenuItemKind::VolumeSync, vol_flag, "Volume Synchronization", "");
 
-    // ── 7. START WITH WINDOWS ─────────────────────────────────────────────
     let auto_flag = autostart_enabled();
     push_custom_item(&mut items, menu, IDM_AUTOSTART, MenuItemKind::AutoStart, auto_flag, "Start with Windows", "");
 
@@ -1819,6 +2143,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let _ = SetMenuInfo(menu, &mi);
     let _ = SetMenuInfo(fav_menu, &mi);
     let _ = SetMenuInfo(hk_menu, &mi);
+    let _ = SetMenuInfo(cushion_menu, &mi);
 
     // Set up active menu context and message hook to keep Favorites open on click!
     let items_ptr: *mut Vec<Box<CustomMenuItem>> = &mut items;
@@ -1853,21 +2178,27 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let _ = UnhookWindowsHookEx(hook);
     }
     *ACTIVE_MENU_CTX.lock().unwrap() = None;
+    reset_dark_styled_hwnds();
 
     let _ = DeleteObject(menu_brush.into());
+    let _ = DestroyMenu(cushion_menu);
     let _ = DestroyMenu(fav_menu);
     let _ = DestroyMenu(hk_menu);
     let _ = DestroyMenu(menu);
+
+    // Trim cold menu pages from working set immediately after menu closes
+    SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
 }
 
 fn is_match(info: &DeviceInfo, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
+    if info.id.eq_ignore_ascii_case(needle) {
+        return true;
+    }
     let n = needle.to_lowercase();
-    info.id.to_lowercase() == n
-        || info.name.to_lowercase().contains(&n)
-        || info.id.to_lowercase().contains(&n)
+    info.name.to_lowercase().contains(&n) || info.id.to_lowercase().contains(&n)
 }
 
 unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
@@ -1895,6 +2226,31 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
             shared.restart.store(true, Ordering::Relaxed);
             shared.signal_wake();
         }
+        IDM_PAUSE_MIRROR => {
+            let next_manual = !shared.manual_paused.load(Ordering::Relaxed);
+            shared.manual_paused.store(next_manual, Ordering::Relaxed);
+            if next_manual {
+                shared.paused.store(true, Ordering::Relaxed);
+            } else {
+                // Resume only if current Windows default output matches mirror source
+                let is_src = with_ui_enumerator(|en| default_device_id(en))
+                    .flatten()
+                    .map(|def| {
+                        let resolved = shared.resolved_src_id.lock().unwrap();
+                        let target = if !resolved.is_empty() {
+                            &*resolved
+                        } else {
+                            &*shared.src.lock().unwrap()
+                        };
+                        !target.is_empty() && def.eq_ignore_ascii_case(target)
+                    })
+                    .unwrap_or(false);
+                shared.paused.store(!is_src, Ordering::Relaxed);
+            }
+            shared.restart.store(true, Ordering::Relaxed);
+            shared.signal_wake();
+            update_tooltip(hwnd, shared);
+        }
         IDM_CYCLE_DEVICE => {
             cycle_audio_device(hwnd);
         }
@@ -1902,6 +2258,15 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
             shared.favorites.lock().unwrap().clear();
             save_current_settings(shared);
             show_balloon(shared, "Favorites Cleared", "Audio switcher will cycle through all active devices.");
+        }
+        _ if id >= IDM_CUSHION_BASE && id <= IDM_CUSHION_END => {
+            if let Some(&(_, ms, _)) = CUSHION_PRESETS.iter().find(|&&(cid, _, _)| cid == id) {
+                shared.cushion_ms.store(ms, Ordering::Relaxed);
+                save_current_settings(shared);
+                shared.restart.store(true, Ordering::Relaxed);
+                shared.signal_wake();
+                update_tooltip(hwnd, shared);
+            }
         }
         _ if id >= IDM_HOTKEY_BASE && id <= IDM_HOTKEY_SCROLL => {
             let (m, k) = match id {
@@ -1939,16 +2304,20 @@ unsafe fn handle_menu_command(hwnd: HWND, id: u16) {
 }
 
 unsafe fn toggle_favorite(shared: &Shared, idx: usize) {
-    if let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) {
-        if let Ok(devices) = enumerate_devices(&en) {
-            if let Some((_dev, info)) = devices.get(idx) {
-                let mut favs = shared.favorites.lock().unwrap();
-                if favs.contains(&info.id) {
-                    favs.remove(&info.id);
-                } else {
-                    favs.insert(info.id.clone());
-                }
-            }
+    let info_opt = LAST_MENU_DEVICES.lock().unwrap().get(idx).cloned().or_else(|| {
+        with_ui_enumerator(|en| {
+            enumerate_devices(en)
+                .ok()
+                .and_then(|devs| devs.get(idx).map(|d| d.1.clone()))
+        })
+        .flatten()
+    });
+    if let Some(info) = info_opt {
+        let mut favs = shared.favorites.lock().unwrap();
+        if favs.contains(&info.id) {
+            favs.remove(&info.id);
+        } else {
+            favs.insert(info.id);
         }
     }
 }
@@ -1968,38 +2337,41 @@ unsafe fn save_current_settings(shared: &Shared) {
 }
 
 unsafe fn select_device(shared: &Shared, is_src: bool, idx: usize) {
-    if let Ok(en) =
-        CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-    {
-        if let Ok(devices) = enumerate_devices(&en) {
-            if let Some((_dev, info)) = devices.get(idx) {
-                if is_src {
-                    *shared.src.lock().unwrap() = info.id.clone();
-                    *shared.src_name.lock().unwrap() = info.name.clone();
-                    set_default_audio_device(&info.id);
+    let info_opt = LAST_MENU_DEVICES.lock().unwrap().get(idx).cloned().or_else(|| {
+        with_ui_enumerator(|en| {
+            enumerate_devices(en)
+                .ok()
+                .and_then(|devs| devs.get(idx).map(|d| d.1.clone()))
+        })
+        .flatten()
+    });
+    if let Some(info) = info_opt {
+        if is_src {
+            *shared.src.lock().unwrap() = info.id.clone();
+            *shared.resolved_src_id.lock().unwrap() = info.id.clone();
+            *shared.src_name.lock().unwrap() = info.name;
+            set_default_audio_device(&info.id);
+            shared.manual_paused.store(false, Ordering::Relaxed);
+            shared.paused.store(false, Ordering::Relaxed);
+        } else {
+            *shared.dst.lock().unwrap() = info.id;
+            *shared.dst_name.lock().unwrap() = info.name;
+            if let Some(Some(def_id)) = with_ui_enumerator(|en| default_device_id(en)) {
+                let src_id = shared.src.lock().unwrap().clone();
+                if !src_id.is_empty() && def_id.eq_ignore_ascii_case(&src_id) && !shared.manual_paused.load(Ordering::Relaxed) {
                     shared.paused.store(false, Ordering::Relaxed);
-                } else {
-                    *shared.dst.lock().unwrap() = info.id.clone();
-                    *shared.dst_name.lock().unwrap() = info.name.clone();
-                    if let Ok(def) = en.GetDefaultAudioEndpoint(eRender, eMultimedia) {
-                        if let Ok(info_def) = describe(&def) {
-                            if info_def.id == *shared.src.lock().unwrap() {
-                                shared.paused.store(false, Ordering::Relaxed);
-                            }
-                        }
-                    }
                 }
-                shared.restart.store(true, Ordering::Relaxed);
-                shared.signal_wake();
             }
         }
+        shared.restart.store(true, Ordering::Relaxed);
+        shared.signal_wake();
     }
 }
 
 // ─── Tray icon management ────────────────────────────────────────────────────
 
 unsafe fn add_tray_icon(hwnd: HWND) {
-    let icon = create_app_icon();
+    let icon = get_app_icon();
     let mut nid = NOTIFYICONDATAW {
         cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -2009,7 +2381,7 @@ unsafe fn add_tray_icon(hwnd: HWND) {
         hIcon: icon,
         ..Default::default()
     };
-    copy_wide(&mut nid.szTip, "Monitor Mirror");
+    copy_wide(&mut nid.szTip, &format!("Monitor Mirror v{APP_VERSION}"));
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 }
 
@@ -2024,29 +2396,45 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 }
 
 unsafe fn update_tooltip(hwnd: HWND, shared: &Shared) {
+    static LAST_TIP_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let src = shared.src_name.lock().unwrap().clone();
     let dst = shared.dst_name.lock().unwrap().clone();
     let is_paused = shared.paused.load(Ordering::Relaxed);
+    let is_manual = shared.manual_paused.load(Ordering::Relaxed);
+    let cushion_ms = shared.cushion_ms.load(Ordering::Relaxed);
 
-    let status = match shared.status.load(Ordering::Relaxed) {
-        STATUS_ACTIVE => "▶ ",
-        STATUS_WAITING => "⏳ ",
-        _ if is_paused => "⏸ ",
-        _ => "",
-    };
-
-    let tip = if is_paused {
-        "⏸ Mirror Paused (Monitors Silent)".to_string()
+    let tip = if is_manual {
+        format!("Monitor Mirror v{APP_VERSION}\n⏸ Mirror Paused (Manual)")
+    } else if is_paused {
+        format!("Monitor Mirror v{APP_VERSION}\n⏸ Paused (Monitors Silent)")
     } else if src.is_empty() && dst.is_empty() {
-        format!("{}Monitor Mirror (no devices selected)", status)
+        format!("Monitor Mirror v{APP_VERSION}\nIdle (no devices selected)")
     } else {
+        let status = match shared.status.load(Ordering::Relaxed) {
+            STATUS_ACTIVE => "▶",
+            STATUS_WAITING => "⏳",
+            _ => "•",
+        };
         format!(
-            "{}Mirror: {} → {}",
+            "Monitor Mirror v{APP_VERSION}\n{} {} ms: {} → {}",
             status,
-            trunc(&src, 28),
-            trunc(&dst, 28)
+            cushion_ms,
+            trunc(&src, 26),
+            trunc(&dst, 26)
         )
     };
+
+    // FNV-1a hash: skip Shell_NotifyIconW IPC if tooltip text is unchanged
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in tip.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    if LAST_TIP_HASH.swap(hash, Ordering::Relaxed) == hash {
+        return;
+    }
+
     let mut nid = NOTIFYICONDATAW {
         cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -2163,45 +2551,39 @@ fn main() {
         let cushion_ms = cfg.cushion_ms.unwrap_or_else(|| saved_cushion.unwrap_or(3));
 
         if !cfg.src.is_empty() || !cfg.dst.is_empty() {
-            if let Ok(en) =
-                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-            {
+            with_ui_enumerator(|en| {
                 for (what, needle) in [("--src", &cfg.src), ("--dst", &cfg.dst)] {
                     if !needle.is_empty() {
-                        if let Ok(Found::Many(n)) = find(&en, needle) {
+                        if let Ok(Found::Many(n)) = find(en, needle) {
                             fatal(&format!(
                                 "{what} \"{needle}\" matches {n} devices. Use the full endpoint ID from --list."
                             ));
                         }
                     }
                 }
-            }
+            });
         }
 
         // Detect if current Windows default audio device is our mirror source
-        let initial_paused = if let Ok(en) =
-            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        {
-            let def_id = en
-                .GetDefaultAudioEndpoint(eRender, eMultimedia)
-                .or_else(|_| en.GetDefaultAudioEndpoint(eRender, eConsole))
-                .ok()
-                .and_then(|d| describe(&d).ok())
-                .map(|info| info.id);
-
+        let initial_paused = with_ui_enumerator(|en| {
+            let def_id = default_device_id(en);
             if let Some(ref cur_def) = def_id {
                 if !cfg.src.is_empty() {
-                    // Paused if default is not our mirror source (e.g. headset active)
-                    cur_def != &cfg.src
+                    if cfg.src.starts_with('{') {
+                        !cur_def.eq_ignore_ascii_case(&cfg.src)
+                    } else if let Ok(Found::One(_, info)) = find(en, &cfg.src) {
+                        !cur_def.eq_ignore_ascii_case(&info.id)
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             } else {
                 false
             }
-        } else {
-            false
-        };
+        })
+        .unwrap_or(false);
 
         let wake_event = CreateEventW(None, false, false, PCWSTR::null()).unwrap_or_default();
         let wake_raw = wake_event.0 as usize;
@@ -2283,5 +2665,42 @@ fn main() {
         shared.signal_wake();
         let _ = audio_handle.join();
         let _ = CloseHandle(wake_event);
+        UI_ENUMERATOR.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_icon_decodes_natively_at_256px() {
+        unsafe {
+            let hicon = CreateIconFromResourceEx(
+                LOGO_PNG,
+                true,
+                0x0003_0000,
+                0,
+                0,
+                LR_DEFAULTCOLOR,
+            )
+            .expect("CreateIconFromResourceEx should natively decode embedded PNG");
+            assert!(!hicon.is_invalid());
+            let _ = DestroyIcon(hicon);
+        }
+    }
+
+    #[test]
+    fn device_matching_and_helpers_work() {
+        let info = DeviceInfo {
+            id: "{0.0.0.00000000}.{ABC-123}".to_string(),
+            name: "PGO32UFS (NVIDIA High Definition Audio)".to_string(),
+        };
+        assert!(is_match(&info, "{0.0.0.00000000}.{abc-123}"));
+        assert!(is_match(&info, "pgo32ufs"));
+        assert!(!is_match(&info, ""));
+        assert_eq!(get_hotkey_description(MOD_CONTROL.0 | MOD_ALT.0, 0x41), "Ctrl+Alt+A");
+        assert_eq!(trunc("Short", 10), "Short");
+        assert_eq!(trunc("LongDeviceName", 4), "Long…");
     }
 }
